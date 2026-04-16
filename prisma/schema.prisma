@@ -1,0 +1,465 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Fund {
+  code             String                   @id
+  name             String
+  pinyin           String?
+  fundType         String?
+  purchaseStatus   String?
+  redeemStatus     String?
+  source           String                   @default("akshare")
+  updatedAt        DateTime                 @updatedAt
+  createdAt        DateTime                 @default(now())
+  navs             FundNavDaily[]
+  ranks            FundRankDaily[]
+  profile          FundProfile?
+  holdings         FundHolding[]
+  bondHoldings     FundBondHolding[]
+  portfolioChanges FundPortfolioChange[]
+  fees             FundFee[]
+  industries       FundIndustryAllocation[]
+  ratings          FundRating[]
+  dividends        FundDividend[]
+  announcements    Announcement[]
+  watchlistEntries Watchlist[]
+  portfolioEntries PortfolioHolding[]
+  alertRules       AlertRule[]
+
+  @@index([name])
+  @@index([fundType])
+}
+
+model FundMoneyDaily {
+  id                         Int       @id @default(autoincrement())
+  fundCode                   String
+  fundName                   String
+  tradeDate                  DateTime
+  tenThousandIncome          Float?
+  sevenDayAnnualized         Float?
+  unitNav                    Float?
+  previousTenThousandIncome  Float?
+  previousSevenDayAnnualized Float?
+  previousUnitNav            Float?
+  dailyGrowthRate            Float?
+  inceptionDate              DateTime?
+  managerNames               String?
+  fee                        String?
+  purchaseStatus             String?
+  source                     String    @default("akshare")
+  createdAt                  DateTime  @default(now())
+
+  @@unique([fundCode, tradeDate])
+  @@index([tradeDate])
+  @@index([sevenDayAnnualized])
+}
+
+model FundExchangeQuote {
+  id                     Int       @id @default(autoincrement())
+  fundCode               String
+  fundName               String
+  exchangeType           String
+  tradeDate              DateTime
+  latestPrice            Float?
+  iopv                   Float?
+  discountRate           Float?
+  changeValue            Float?
+  changeRate             Float?
+  volume                 Float?
+  amount                 Float?
+  openPrice              Float?
+  highPrice              Float?
+  lowPrice               Float?
+  previousClose          Float?
+  turnoverRate           Float?
+  latestShare            Float?
+  circulatingMarketValue Float?
+  totalMarketValue       Float?
+  updateTime             DateTime?
+  source                 String    @default("akshare")
+  createdAt              DateTime  @default(now())
+
+  @@unique([fundCode, exchangeType, tradeDate])
+  @@index([exchangeType, tradeDate])
+  @@index([changeRate])
+}
+
+model FundProfile {
+  fundCode            String    @id
+  fullName            String?
+  inceptionDate       DateTime?
+  latestScale         String?
+  fundCompany         String?
+  managerNames        String?
+  custodianBank       String?
+  fundTypeDetail      String?
+  ratingAgency        String?
+  rating              String?
+  investmentStrategy  String?
+  investmentObjective String?
+  benchmark           String?
+  source              String    @default("akshare")
+  updatedAt           DateTime  @updatedAt
+  createdAt           DateTime  @default(now())
+  fund                Fund      @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+}
+
+model FundNavDaily {
+  id                 Int      @id @default(autoincrement())
+  fundCode           String
+  tradeDate          DateTime
+  unitNav            Float?
+  accumulatedNav     Float?
+  previousUnitNav    Float?
+  dailyGrowthValue   Float?
+  dailyGrowthRate    Float?
+  growthRateSource   String   @default("source")
+  subscriptionStatus String?
+  redemptionStatus   String?
+  source             String   @default("akshare")
+  createdAt          DateTime @default(now())
+  fund               Fund     @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+
+  @@unique([fundCode, tradeDate])
+  @@index([tradeDate])
+  @@index([dailyGrowthRate])
+}
+
+model FundRankDaily {
+  id        Int      @id @default(autoincrement())
+  fundCode  String
+  rankDate  DateTime
+  rangeKey  String
+  rankValue Float?
+  source    String   @default("akshare")
+  createdAt DateTime @default(now())
+  fund      Fund     @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+
+  @@unique([fundCode, rankDate, rangeKey])
+  @@index([rankDate])
+  @@index([rangeKey])
+}
+
+model FundHolding {
+  id           Int      @id @default(autoincrement())
+  fundCode     String
+  reportPeriod String
+  stockCode    String
+  stockName    String
+  ratio        Float?
+  shares       Float?
+  marketValue  Float?
+  source       String   @default("akshare")
+  createdAt    DateTime @default(now())
+  fund         Fund     @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+
+  @@unique([fundCode, reportPeriod, stockCode, stockName])
+  @@index([fundCode, reportPeriod])
+  @@index([stockCode])
+}
+
+model FundBondHolding {
+  id           Int      @id @default(autoincrement())
+  fundCode     String
+  reportPeriod String
+  bondCode     String
+  bondName     String
+  ratio        Float?
+  marketValue  Float?
+  source       String   @default("akshare")
+  createdAt    DateTime @default(now())
+  fund         Fund     @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+
+  @@unique([fundCode, reportPeriod, bondCode, bondName])
+  @@index([fundCode, reportPeriod])
+  @@index([bondCode])
+}
+
+model FundPortfolioChange {
+  id         Int      @id @default(autoincrement())
+  fundCode   String
+  reportYear String
+  changeType String
+  stockCode  String
+  stockName  String
+  amount     Float?
+  ratio      Float?
+  source     String   @default("akshare")
+  createdAt  DateTime @default(now())
+  fund       Fund     @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+
+  @@unique([fundCode, reportYear, changeType, stockCode, stockName])
+  @@index([fundCode, reportYear])
+}
+
+model FundIndustryAllocation {
+  id           Int      @id @default(autoincrement())
+  fundCode     String
+  reportDate   DateTime
+  industryName String
+  ratio        Float?
+  marketValue  Float?
+  source       String   @default("akshare")
+  createdAt    DateTime @default(now())
+  fund         Fund     @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+
+  @@unique([fundCode, reportDate, industryName])
+  @@index([fundCode, reportDate])
+}
+
+model FundMarketScale {
+  id             Int      @id @default(autoincrement())
+  reportDate     DateTime @unique
+  fundCount      Int?
+  purchaseAmount Float?
+  redeemAmount   Float?
+  totalShare     Float?
+  netAsset       Float?
+  source         String   @default("akshare")
+  createdAt      DateTime @default(now())
+}
+
+model FundHolderStructure {
+  id               Int      @id @default(autoincrement())
+  reportDate       DateTime @unique
+  fundCount        Int?
+  institutionRatio Float?
+  individualRatio  Float?
+  internalRatio    Float?
+  totalShare       Float?
+  source           String   @default("akshare")
+  createdAt        DateTime @default(now())
+}
+
+model FundFee {
+  id            Int      @id @default(autoincrement())
+  fundCode      String
+  feeType       String
+  conditionName String
+  feeValue      String?
+  source        String   @default("akshare")
+  createdAt     DateTime @default(now())
+  fund          Fund     @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+
+  @@unique([fundCode, feeType, conditionName])
+  @@index([fundCode, feeType])
+}
+
+model FundRating {
+  id            Int       @id @default(autoincrement())
+  fundCode      String
+  fundName      String?
+  managerNames  String?
+  fundCompany   String?
+  ratingDate    DateTime?
+  fiveStarCount Int?
+  shRating      Float?
+  zsRating      Float?
+  jaRating      Float?
+  morningstar   Float?
+  fee           String?
+  fundType      String?
+  source        String    @default("akshare")
+  createdAt     DateTime  @default(now())
+  fund          Fund      @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+
+  @@unique([fundCode, source])
+  @@index([fundCompany])
+  @@index([fiveStarCount])
+}
+
+model FundManager {
+  id             Int       @id @default(autoincrement())
+  managerId      String?
+  managerName    String
+  fundCompany    String?
+  currentFundNum Int?
+  bestReturn     Float?
+  totalReturn    Float?
+  startDate      DateTime?
+  source         String    @default("akshare")
+  rawSummary     String?
+  createdAt      DateTime  @default(now())
+
+  @@unique([managerName, fundCompany])
+  @@index([fundCompany])
+}
+
+model FundDividend {
+  id                 Int       @id @default(autoincrement())
+  fundCode           String
+  fundName           String?
+  eventKey           String
+  dividendType       String
+  registrationDate   DateTime?
+  exDividendDate     DateTime?
+  paymentDate        DateTime?
+  dividendPerShare   Float?
+  dividendPer10      Float?
+  cumulativeDividend Float?
+  cumulativeCount    Int?
+  announcementTitle  String?
+  announcementUrl    String?
+  source             String    @default("akshare")
+  createdAt          DateTime  @default(now())
+  fund               Fund      @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+
+  @@unique([fundCode, eventKey, source])
+  @@index([registrationDate])
+  @@index([exDividendDate])
+  @@index([paymentDate])
+}
+
+model WealthProduct {
+  registerCode         String             @id
+  name                 String
+  issuer               String?
+  riskLevel            String?
+  operationMode        String?
+  productType          String?
+  saleStatus           String?
+  performanceBenchmark String?
+  minPurchaseAmount    Float?
+  investmentTerm       String?
+  openDate             DateTime?
+  nextOpenDate         DateTime?
+  redeemArrival        String?
+  managerName          String?
+  custodianName        String?
+  feeSummary           String?
+  assetAllocation      String?
+  liquidityNote        String?
+  latestDisclosureAt   DateTime?
+  source               String             @default("chinawealth")
+  sourceUrl            String?
+  updatedAt            DateTime           @updatedAt
+  createdAt            DateTime           @default(now())
+  navs                 WealthNavDaily[]
+  announcements        Announcement[]
+  watchlistEntries     Watchlist[]
+  portfolioEntries     PortfolioHolding[]
+  alertRules           AlertRule[]
+
+  @@index([name])
+  @@index([issuer])
+  @@index([riskLevel])
+}
+
+model PortfolioHolding {
+  id           Int            @id @default(autoincrement())
+  targetType   String
+  targetKey    String
+  fundCode     String?
+  registerCode String?
+  displayName  String?
+  shares       Float?
+  costAmount   Float?
+  costPrice    Float?
+  purchaseDate DateTime?
+  note         String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  fund         Fund?          @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+  product      WealthProduct? @relation(fields: [registerCode], references: [registerCode], onDelete: Cascade)
+
+  @@unique([targetType, targetKey])
+  @@index([targetType])
+  @@index([fundCode])
+  @@index([registerCode])
+}
+
+model AlertRule {
+  id           Int            @id @default(autoincrement())
+  targetType   String
+  targetKey    String?
+  fundCode     String?
+  registerCode String?
+  metric       String
+  threshold    Float?
+  enabled      Boolean        @default(true)
+  note         String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  fund         Fund?          @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+  product      WealthProduct? @relation(fields: [registerCode], references: [registerCode], onDelete: Cascade)
+
+  @@index([targetType])
+  @@index([metric])
+  @@index([fundCode])
+  @@index([registerCode])
+}
+
+model WealthNavDaily {
+  id               Int           @id @default(autoincrement())
+  registerCode     String
+  navDate          DateTime
+  netValue         Float?
+  accumulatedValue Float?
+  dailyChange      Float?
+  dailyChangeRate  Float?
+  changeSource     String        @default("calculated")
+  source           String        @default("chinawealth")
+  createdAt        DateTime      @default(now())
+  product          WealthProduct @relation(fields: [registerCode], references: [registerCode], onDelete: Cascade)
+
+  @@unique([registerCode, navDate])
+  @@index([navDate])
+  @@index([dailyChangeRate])
+}
+
+model Announcement {
+  id           Int            @id @default(autoincrement())
+  targetType   String
+  fundCode     String?
+  registerCode String?
+  title        String
+  url          String
+  publishedAt  DateTime?
+  source       String
+  createdAt    DateTime       @default(now())
+  fund         Fund?          @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+  product      WealthProduct? @relation(fields: [registerCode], references: [registerCode], onDelete: Cascade)
+
+  @@unique([targetType, title, url])
+  @@index([publishedAt])
+  @@index([fundCode])
+  @@index([registerCode])
+}
+
+model Watchlist {
+  id           Int            @id @default(autoincrement())
+  targetType   String
+  targetKey    String
+  fundCode     String?
+  registerCode String?
+  note         String?
+  createdAt    DateTime       @default(now())
+  fund         Fund?          @relation(fields: [fundCode], references: [code], onDelete: Cascade)
+  product      WealthProduct? @relation(fields: [registerCode], references: [registerCode], onDelete: Cascade)
+
+  @@unique([targetType, targetKey])
+  @@index([targetType])
+}
+
+model SyncJob {
+  id               Int       @id @default(autoincrement())
+  jobType          String
+  status           String
+  startedAt        DateTime
+  finishedAt       DateTime?
+  fundRows         Int       @default(0)
+  wealthRows       Int       @default(0)
+  announcementRows Int       @default(0)
+  failedSources    String?
+  message          String?
+  createdAt        DateTime  @default(now())
+
+  @@index([jobType, startedAt])
+  @@index([status])
+}
