@@ -9,18 +9,26 @@ export const metadata: Metadata = {
 
 const navItems = [
   { href: "/", label: "首页" },
-  { href: "/portfolio", label: "持仓" },
+  { href: "/portfolio", label: "我的持仓" },
   { href: "/funds", label: "基金" },
-  { href: "/funds/rankings", label: "排行" },
-  { href: "/funds/money", label: "货币" },
-  { href: "/funds/exchange", label: "场内" },
-  { href: "/funds/market", label: "市场" },
-  { href: "/funds/ratings", label: "评级" },
-  { href: "/funds/managers", label: "经理" },
   { href: "/wealth", label: "理财" },
-  { href: "/compare", label: "对比" },
-  { href: "/alerts", label: "提醒" },
-  { href: "/sync", label: "采集状态" }
+  { href: "/sync", label: "数据" }
+];
+
+const fundLinks = [
+  { href: "/funds/rankings", label: "收益排行" },
+  { href: "/funds/money", label: "货币基金" },
+  { href: "/funds/exchange", label: "场内基金" },
+  { href: "/funds/ratings", label: "基金评级" },
+  { href: "/funds/managers", label: "基金经理" },
+  { href: "/funds/market", label: "规模结构" },
+  { href: "/funds/announcements", label: "公告中心" },
+  { href: "/funds/dividends", label: "分红配送" }
+];
+
+const toolLinks = [
+  { href: "/compare", label: "产品对比" },
+  { href: "/alerts", label: "提醒中心" }
 ];
 
 export default function RootLayout({
@@ -36,7 +44,7 @@ export default function RootLayout({
             <Link href="/" className="text-xl font-semibold text-ink focus-ring rounded">
               理财与基金数据看板
             </Link>
-            <nav className="flex flex-wrap gap-2">
+            <nav className="flex flex-wrap items-center gap-2">
               {navItems.map((item) => (
                 <Link
                   key={item.href}
@@ -46,6 +54,38 @@ export default function RootLayout({
                   {item.label}
                 </Link>
               ))}
+              <details className="nav-menu relative">
+                <summary className="focus-ring list-none rounded-md border border-line bg-white px-3 py-2 text-sm text-slate-700 transition hover:border-steel hover:text-ink">
+                  基金工具
+                </summary>
+                <div className="absolute right-0 z-20 mt-2 grid w-44 gap-1 rounded-md border border-line bg-white p-2 shadow-panel">
+                  {fundLinks.map((item) => (
+                    <Link
+                      key={item.href}
+                      href={item.href}
+                      className="focus-ring rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-paper hover:text-ink"
+                    >
+                      {item.label}
+                    </Link>
+                  ))}
+                </div>
+              </details>
+              <details className="nav-menu relative">
+                <summary className="focus-ring list-none rounded-md border border-line bg-white px-3 py-2 text-sm text-slate-700 transition hover:border-steel hover:text-ink">
+                  工具
+                </summary>
+                <div className="absolute right-0 z-20 mt-2 grid w-36 gap-1 rounded-md border border-line bg-white p-2 shadow-panel">
+                  {toolLinks.map((item) => (
+                    <Link
+                      key={item.href}
+                      href={item.href}
+                      className="focus-ring rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-paper hover:text-ink"
+                    >
+                      {item.label}
+                    </Link>
+                  ))}
+                </div>
+              </details>
             </nav>
           </div>
         </header>

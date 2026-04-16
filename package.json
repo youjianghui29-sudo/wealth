@@ -10,6 +10,8 @@
     "db:push": "python scripts/collector/init_db.py && prisma generate",
     "collect": "python scripts/collector/run_daily.py",
     "collect:seed": "python scripts/collector/run_daily.py --seed",
+    "collect:backfill": "python scripts/collector/run_backfill.py",
+    "collect:backfill:full": "python scripts/collector/run_backfill.py --full",
     "collect:fund-profiles": "python scripts/collector/run_fund_profiles.py --limit 23030",
     "collect:fund-extras": "python scripts/collector/run_fund_extras.py",
     "collect:fund-dividends": "python scripts/collector/run_fund_dividends.py"

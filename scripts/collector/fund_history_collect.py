@@ -81,6 +81,7 @@ def collect_fund_history(conn, seed: bool = False, limit: int | None = None) -> 
             )
             previous = unit_nav
             total += 1
+        conn.commit()
 
     conn.commit()
     return total

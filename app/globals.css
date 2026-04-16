@@ -49,3 +49,11 @@ select {
   outline: 3px solid rgba(63, 111, 143, 0.35);
   outline-offset: 2px;
 }
+
+.nav-menu > summary {
+  cursor: pointer;
+}
+
+.nav-menu > summary::-webkit-details-marker {
+  display: none;
+}

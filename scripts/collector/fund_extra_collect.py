@@ -45,14 +45,17 @@ def collect_fund_extras(conn, seed: bool = False) -> dict[str, int]:
     except ImportError as exc:
         raise RuntimeError("缺少 Python 依赖 akshare，请运行 pip install -r requirements.txt") from exc
 
-    results = {
-        "open_rank": collect_open_rankings(conn, ak),
-        "money": collect_money_funds(conn, ak),
-        "exchange": collect_exchange_funds(conn, ak),
-        "market": collect_market_stats(conn, ak),
-        "ratings": collect_ratings(conn, ak),
-        "managers": collect_managers(conn, ak),
-    }
+    results: dict[str, int] = {}
+    for key, collector in [
+        ("open_rank", collect_open_rankings),
+        ("money", collect_money_funds),
+        ("exchange", collect_exchange_funds),
+        ("market", collect_market_stats),
+        ("ratings", collect_ratings),
+        ("managers", collect_managers),
+    ]:
+        results[key] = collector(conn, ak)
+        conn.commit()
     conn.commit()
     return results
 
@@ -84,6 +87,7 @@ def collect_open_rankings(conn, ak) -> int:
                         rank_value=to_float(row.get(column)),
                     )
                     rows += 1
+        conn.commit()
     return rows
 
 
@@ -238,6 +242,8 @@ def collect_ratings(conn, ak) -> int:
             fund_type=clean_text(row.get("类型")),
         )
         rows += 1
+        if rows % 1000 == 0:
+            conn.commit()
     return rows
 
 
@@ -266,6 +272,8 @@ def collect_managers(conn, ak) -> int:
             raw_summary=" | ".join(f"{k}:{clean_text(v)}" for k, v in row.to_dict().items() if clean_text(v))[:2000],
         )
         rows += 1
+        if rows % 1000 == 0:
+            conn.commit()
     return rows
 
 

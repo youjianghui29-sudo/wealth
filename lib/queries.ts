@@ -156,12 +156,374 @@ function parseScaleYi(value: string | null | undefined) {
   return amount;
 }
 
-export async function getLatestSyncJob() {
-  return prisma.syncJob.findFirst({
-    orderBy: {
-      startedAt: "desc"
-    }
+function toCount(value: unknown) {
+  return Number(value ?? 0);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
   });
+}
+
+function isDatabaseLocked(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("database is locked");
+}
+
+async function withDatabaseRetry<T>(fn: () => Promise<T>, attempts = 8): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (!isDatabaseLocked(error) || attempt === attempts - 1) {
+        throw error;
+      }
+      await sleep(250 * (attempt + 1));
+    }
+  }
+  throw lastError;
+}
+
+function coverageStatus(ratio: number | null, value: number, goodAt = 90, warnAt = 50) {
+  if (ratio === null) {
+    return value > 0 ? "good" : "bad";
+  }
+  if (ratio >= goodAt) {
+    return "good";
+  }
+  if (ratio >= warnAt) {
+    return "warn";
+  }
+  return "bad";
+}
+
+function coverageMetric(input: {
+  key: string;
+  label: string;
+  value: number;
+  total?: number | null;
+  latestDate?: Date | string | null;
+  note?: string;
+  goodAt?: number;
+  warnAt?: number;
+}) {
+  const ratio = input.total && input.total > 0 ? (input.value / input.total) * 100 : null;
+  return {
+    key: input.key,
+    label: input.label,
+    value: input.value,
+    total: input.total ?? null,
+    ratio,
+    latestDate: input.latestDate ?? null,
+    status: coverageStatus(ratio, input.value, input.goodAt, input.warnAt),
+    note: input.note ?? null
+  };
+}
+
+export async function getLatestSyncJob() {
+  const rows = await withDatabaseRetry(() => prisma.$queryRaw<
+    Array<{
+      id: number;
+      jobType: string;
+      status: string;
+      startedAt: string | null;
+      finishedAt: string | null;
+      fundRows: number | null;
+      wealthRows: number | null;
+      announcementRows: number | null;
+      failedSources: string | null;
+      message: string | null;
+      createdAt: string | null;
+    }>
+  >`
+    SELECT
+      id,
+      CAST(jobType AS TEXT) AS jobType,
+      CAST(status AS TEXT) AS status,
+      CAST(startedAt AS TEXT) AS startedAt,
+      CAST(finishedAt AS TEXT) AS finishedAt,
+      fundRows,
+      wealthRows,
+      announcementRows,
+      CAST(failedSources AS TEXT) AS failedSources,
+      CAST(message AS TEXT) AS message,
+      CAST(createdAt AS TEXT) AS createdAt
+    FROM SyncJob
+    ORDER BY startedAt DESC
+    LIMIT 1
+  `);
+  return rows[0] ?? null;
+}
+
+export async function getRecentSyncJobs(limit = 30) {
+  return withDatabaseRetry(() => prisma.$queryRaw<
+    Array<{
+      id: number;
+      jobType: string;
+      status: string;
+      startedAt: string | null;
+      finishedAt: string | null;
+      fundRows: number | null;
+      wealthRows: number | null;
+      announcementRows: number | null;
+      failedSources: string | null;
+      message: string | null;
+    }>
+  >`
+    SELECT
+      id,
+      CAST(jobType AS TEXT) AS jobType,
+      CAST(status AS TEXT) AS status,
+      CAST(startedAt AS TEXT) AS startedAt,
+      CAST(finishedAt AS TEXT) AS finishedAt,
+      fundRows,
+      wealthRows,
+      announcementRows,
+      CAST(failedSources AS TEXT) AS failedSources,
+      CAST(message AS TEXT) AS message
+    FROM SyncJob
+    ORDER BY startedAt DESC
+    LIMIT ${limit}
+  `);
+}
+
+export async function getDataCoverage() {
+  const [
+    fundTotalRows,
+    fundNavFundsRows,
+    fundNavLatestRows,
+    fundHistory14Rows,
+    rankLatestRows,
+    profileRows,
+    feeRows,
+    stockHoldingRows,
+    bondHoldingRows,
+    industryRows,
+    portfolioChangeRows,
+    dividendRows,
+    announcementRows,
+    ratingRows,
+    moneyLatestRows,
+    exchangeLatestRows,
+    marketScaleRows,
+    wealthTotalRows,
+    wealthNavFundsRows,
+    wealthLatestRows
+  ] = await withDatabaseRetry(() => Promise.all([
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(*) AS value FROM Fund`,
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(DISTINCT fundCode) AS value FROM FundNavDaily`,
+    prisma.$queryRaw<Array<{ latestDate: string | null; value: number }>>`
+      SELECT MAX(tradeDate) AS latestDate, COUNT(*) AS value
+      FROM FundNavDaily
+      WHERE tradeDate = (SELECT MAX(tradeDate) FROM FundNavDaily)
+    `,
+    prisma.$queryRaw<Array<{ value: number }>>`
+      SELECT COUNT(*) AS value
+      FROM (
+        SELECT fundCode
+        FROM FundNavDaily
+        GROUP BY fundCode
+        HAVING COUNT(*) >= 14
+      )
+    `,
+    prisma.$queryRaw<Array<{ latestDate: string | null; value: number; funds: number }>>`
+      SELECT MAX(rankDate) AS latestDate, COUNT(*) AS value, COUNT(DISTINCT fundCode) AS funds
+      FROM FundRankDaily
+      WHERE rankDate = (
+        SELECT MAX(rankDate)
+        FROM FundRankDaily
+        WHERE rankDate LIKE '20%'
+      )
+    `,
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(DISTINCT fundCode) AS value FROM FundProfile`,
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(DISTINCT fundCode) AS value FROM FundFee`,
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(DISTINCT fundCode) AS value FROM FundHolding`,
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(DISTINCT fundCode) AS value FROM FundBondHolding`,
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(DISTINCT fundCode) AS value FROM FundIndustryAllocation`,
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(DISTINCT fundCode) AS value FROM FundPortfolioChange`,
+    prisma.$queryRaw<Array<{ value: number; rows: number }>>`
+      SELECT COUNT(DISTINCT fundCode) AS value, COUNT(*) AS rows
+      FROM FundDividend
+    `,
+    prisma.$queryRaw<Array<{ value: number; rows: number }>>`
+      SELECT COUNT(DISTINCT fundCode) AS value, COUNT(*) AS rows
+      FROM Announcement
+      WHERE targetType = 'fund'
+    `,
+    prisma.$queryRaw<Array<{ value: number; rows: number }>>`
+      SELECT COUNT(DISTINCT fundCode) AS value, COUNT(*) AS rows
+      FROM FundRating
+    `,
+    prisma.$queryRaw<Array<{ latestDate: string | null; value: number }>>`
+      SELECT MAX(tradeDate) AS latestDate, COUNT(*) AS value
+      FROM FundMoneyDaily
+      WHERE tradeDate = (SELECT MAX(tradeDate) FROM FundMoneyDaily)
+    `,
+    prisma.$queryRaw<Array<{ latestDate: string | null; value: number }>>`
+      SELECT MAX(tradeDate) AS latestDate, COUNT(*) AS value
+      FROM FundExchangeQuote
+      WHERE tradeDate = (SELECT MAX(tradeDate) FROM FundExchangeQuote)
+    `,
+    prisma.$queryRaw<Array<{ scaleRows: number; holderRows: number }>>`
+      SELECT
+        (SELECT COUNT(*) FROM FundMarketScale) AS scaleRows,
+        (SELECT COUNT(*) FROM FundHolderStructure) AS holderRows
+    `,
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(*) AS value FROM WealthProduct`,
+    prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(DISTINCT registerCode) AS value FROM WealthNavDaily`,
+    prisma.$queryRaw<Array<{ latestDate: string | null; value: number }>>`
+      SELECT MAX(navDate) AS latestDate, COUNT(*) AS value
+      FROM WealthNavDaily
+      WHERE navDate = (SELECT MAX(navDate) FROM WealthNavDaily)
+    `
+  ]));
+
+  const fundTotal = toCount(fundTotalRows[0]?.value);
+  const wealthTotal = toCount(wealthTotalRows[0]?.value);
+  const dividendFundCount = toCount(dividendRows[0]?.value);
+  const announcementFundCount = toCount(announcementRows[0]?.value);
+  const ratingFundCount = toCount(ratingRows[0]?.value);
+
+  const metrics = [
+    coverageMetric({
+      key: "fund_nav_latest",
+      label: "基金最新净值",
+      value: toCount(fundNavLatestRows[0]?.value),
+      total: fundTotal,
+      latestDate: fundNavLatestRows[0]?.latestDate,
+      note: "每日涨跌、单位净值、累计净值"
+    }),
+    coverageMetric({
+      key: "fund_history_14",
+      label: "基金 14 日历史",
+      value: toCount(fundHistory14Rows[0]?.value),
+      total: fundTotal,
+      note: "用于曲线、回撤、波动率计算"
+    }),
+    coverageMetric({
+      key: "fund_rank",
+      label: "多维收益排行",
+      value: toCount(rankLatestRows[0]?.funds),
+      total: fundTotal,
+      latestDate: rankLatestRows[0]?.latestDate,
+      note: `${toCount(rankLatestRows[0]?.value).toLocaleString("zh-CN")} 条区间收益记录`
+    }),
+    coverageMetric({
+      key: "fund_profile",
+      label: "基金画像",
+      value: toCount(profileRows[0]?.value),
+      total: fundTotal,
+      note: "基金公司、经理、规模、投资目标"
+    }),
+    coverageMetric({
+      key: "fund_fee",
+      label: "费率信息",
+      value: toCount(feeRows[0]?.value),
+      total: fundTotal,
+      note: "申购、赎回、管理、托管等费用"
+    }),
+    coverageMetric({
+      key: "fund_stock_holding",
+      label: "股票持仓",
+      value: toCount(stockHoldingRows[0]?.value),
+      total: fundTotal,
+      note: "定期报告前十大/披露持仓"
+    }),
+    coverageMetric({
+      key: "fund_bond_holding",
+      label: "债券持仓",
+      value: toCount(bondHoldingRows[0]?.value),
+      total: fundTotal,
+      note: "债券型产品覆盖更有意义",
+      goodAt: 25,
+      warnAt: 10
+    }),
+    coverageMetric({
+      key: "fund_industry",
+      label: "行业配置",
+      value: toCount(industryRows[0]?.value),
+      total: fundTotal,
+      note: "股票/混合/指数基金行业暴露"
+    }),
+    coverageMetric({
+      key: "fund_portfolio_change",
+      label: "买入卖出明细",
+      value: toCount(portfolioChangeRows[0]?.value),
+      total: fundTotal,
+      note: "报告期累计买卖股票"
+    }),
+    coverageMetric({
+      key: "fund_rating",
+      label: "基金评级",
+      value: ratingFundCount,
+      total: fundTotal,
+      note: `${toCount(ratingRows[0]?.rows).toLocaleString("zh-CN")} 条评级记录`,
+      goodAt: 60,
+      warnAt: 30
+    }),
+    coverageMetric({
+      key: "fund_dividend",
+      label: "分红配送",
+      value: dividendFundCount,
+      total: null,
+      note: `${toCount(dividendRows[0]?.rows).toLocaleString("zh-CN")} 条历史分红，未分红基金不会有记录`
+    }),
+    coverageMetric({
+      key: "fund_announcement",
+      label: "基金公告",
+      value: announcementFundCount,
+      total: fundTotal,
+      note: `${toCount(announcementRows[0]?.rows).toLocaleString("zh-CN")} 条公告/报告链接`
+    }),
+    coverageMetric({
+      key: "money_fund",
+      label: "货币基金",
+      value: toCount(moneyLatestRows[0]?.value),
+      total: null,
+      latestDate: moneyLatestRows[0]?.latestDate,
+      note: "万份收益、7 日年化"
+    }),
+    coverageMetric({
+      key: "exchange_fund",
+      label: "场内基金",
+      value: toCount(exchangeLatestRows[0]?.value),
+      total: null,
+      latestDate: exchangeLatestRows[0]?.latestDate,
+      note: "ETF/LOF 行情、折溢价"
+    }),
+    coverageMetric({
+      key: "market_stats",
+      label: "市场结构",
+      value: toCount(marketScaleRows[0]?.scaleRows) + toCount(marketScaleRows[0]?.holderRows),
+      total: null,
+      note: "规模变动和持有人结构"
+    }),
+    coverageMetric({
+      key: "wealth_nav",
+      label: "银行理财公开样本",
+      value: toCount(wealthNavFundsRows[0]?.value),
+      total: wealthTotal,
+      latestDate: wealthLatestRows[0]?.latestDate,
+      note: `${toCount(wealthLatestRows[0]?.value).toLocaleString("zh-CN")} 条最新净值；非全市场授权数据`
+    })
+  ];
+
+  const recommendations = [
+    "白天边看页面边补数，建议运行 python scripts/collector/run_backfill.py --profile-limit 200 --history-limit 200。",
+    "夜间或不用页面时再运行 python scripts/collector/run_backfill.py --full；该任务会按缺失优先级续跑，但全量基金画像预计耗时很长。",
+    "银行理财公开源只能抓到可见样本；若要全市场，需要接入普益标准、Wind、Choice、iFinD 或用 WEALTH_PRODUCTS_JSON 导入授权数据。"
+  ];
+
+  return {
+    fundTotal,
+    wealthTotal,
+    fundWithAnyNav: toCount(fundNavFundsRows[0]?.value),
+    metrics,
+    recommendations
+  };
 }
 
 export async function getSummary() {
