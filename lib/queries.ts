@@ -20,6 +20,17 @@ const FUND_DETAIL_RETURN_RANGES = [
   { key: "year_to_date", label: "今年来" },
   { key: "since_inception", label: "成立来" }
 ];
+const FUND_LIST_RETURN_RANGES = [
+  "week_1",
+  "month_1",
+  "month_3",
+  "month_6",
+  "year_1",
+  "year_2",
+  "year_3",
+  "year_to_date",
+  "since_inception"
+];
 
 type AlertItem = {
   level: "high" | "medium" | "low";
@@ -37,6 +48,13 @@ function toPositiveInt(value: string | number | undefined | null, fallback: numb
   }
 
   return Math.floor(parsed);
+}
+
+function optionalNumber(value: string | number | undefined | null) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return NaN;
+  }
+  return Number(value);
 }
 
 function clampPageSize(value: string | number | undefined | null) {
@@ -116,6 +134,50 @@ function calculateRiskMetrics(
     sharpe,
     annualizedReturn
   };
+}
+
+async function attachFundListRiskMetrics<T extends FundListItem>(items: T[]) {
+  const codes = items.map((item) => item.code);
+  if (codes.length === 0) {
+    return items;
+  }
+
+  const navRows = await prisma.fundNavDaily.findMany({
+    where: {
+      fundCode: { in: codes },
+      unitNav: { not: null }
+    },
+    orderBy: [{ fundCode: "asc" }, { tradeDate: "desc" }],
+    select: {
+      fundCode: true,
+      tradeDate: true,
+      unitNav: true,
+      dailyGrowthRate: true
+    }
+  });
+
+  const navsByCode = new Map<string, typeof navRows>();
+  for (const nav of navRows) {
+    const bucket = navsByCode.get(nav.fundCode) ?? [];
+    if (bucket.length < 380) {
+      bucket.push(nav);
+      navsByCode.set(nav.fundCode, bucket);
+    }
+  }
+
+  return items.map((item) => {
+    const navs = [...(navsByCode.get(item.code) ?? [])].reverse();
+    const riskMetrics = calculateRiskMetrics(navs);
+    return {
+      ...item,
+      maxDrawdown: riskMetrics.maxDrawdown,
+      volatility: riskMetrics.volatility
+    };
+  });
+}
+
+function normalizeReturnRange(value: string | null | undefined) {
+  return value && FUND_LIST_RETURN_RANGES.includes(value) ? value : "year_1";
 }
 
 function periodChange<T extends { navDate: Date | string; netValue: number | null }>(navs: T[], days: number) {
@@ -586,6 +648,9 @@ export async function getFundList(params: {
   type?: string | null;
   direction?: string | null;
   purchaseStatus?: string | null;
+  returnRange?: string | null;
+  minReturn?: string | number | null;
+  maxDrawdown?: string | number | null;
   minRate?: string | number | null;
   maxRate?: string | number | null;
   sort?: string | null;
@@ -596,6 +661,7 @@ export async function getFundList(params: {
   const pageSize = clampPageSize(params.pageSize);
   const offset = (page - 1) * pageSize;
   const filters: Prisma.Sql[] = [];
+  const returnRange = normalizeReturnRange(params.returnRange);
 
   if (params.q) {
     const pattern = `%${params.q.trim()}%`;
@@ -619,8 +685,11 @@ export async function getFundList(params: {
     filters.push(Prisma.sql`latest.dailyGrowthRate = 0`);
   }
 
-  const minRate = params.minRate !== undefined && params.minRate !== null ? Number(params.minRate) : NaN;
-  const maxRate = params.maxRate !== undefined && params.maxRate !== null ? Number(params.maxRate) : NaN;
+  const minRate = optionalNumber(params.minRate);
+  const maxRate = optionalNumber(params.maxRate);
+  const minReturn = optionalNumber(params.minReturn);
+  const maxDrawdown = optionalNumber(params.maxDrawdown);
+  const usesRiskSql = Number.isFinite(maxDrawdown) || params.sort === "drawdown_desc";
 
   if (Number.isFinite(minRate)) {
     filters.push(Prisma.sql`latest.dailyGrowthRate >= ${minRate}`);
@@ -630,18 +699,74 @@ export async function getFundList(params: {
     filters.push(Prisma.sql`latest.dailyGrowthRate <= ${maxRate}`);
   }
 
+  if (Number.isFinite(minReturn)) {
+    filters.push(Prisma.sql`selectedRank.rankValue >= ${minReturn}`);
+  }
+
+  if (Number.isFinite(maxDrawdown)) {
+    filters.push(Prisma.sql`risk.maxDrawdown >= ${maxDrawdown}`);
+  }
+
   const whereSql = filters.length
     ? Prisma.sql`WHERE ${Prisma.join(filters, " AND ")}`
     : Prisma.empty;
+
+  const riskWithSql = usesRiskSql
+    ? Prisma.sql`
+      WITH recent_nav AS (
+        SELECT
+          fundCode,
+          tradeDate,
+          unitNav,
+          dailyGrowthRate,
+          ROW_NUMBER() OVER (PARTITION BY fundCode ORDER BY tradeDate DESC) AS recency
+        FROM FundNavDaily
+        WHERE unitNav IS NOT NULL AND unitNav > 0
+      ),
+      ordered_nav AS (
+        SELECT fundCode, tradeDate, unitNav, dailyGrowthRate
+        FROM recent_nav
+        WHERE recency <= 380
+      ),
+      nav_window AS (
+        SELECT
+          fundCode,
+          tradeDate,
+          unitNav,
+          MAX(unitNav) OVER (
+            PARTITION BY fundCode
+            ORDER BY tradeDate ASC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS runningPeak
+        FROM ordered_nav
+      ),
+      risk AS (
+        SELECT
+          fundCode,
+          MIN((unitNav / NULLIF(runningPeak, 0) - 1) * 100) AS maxDrawdown
+        FROM nav_window
+        GROUP BY fundCode
+      )
+    `
+    : Prisma.empty;
+  const riskJoinSql = usesRiskSql ? Prisma.sql`LEFT JOIN risk ON risk.fundCode = f.code` : Prisma.empty;
+  const riskSelectSql = usesRiskSql ? Prisma.sql`risk.maxDrawdown` : Prisma.sql`NULL`;
 
   const orderSql =
     params.sort === "growth_asc"
       ? Prisma.sql`latest.dailyGrowthRate ASC NULLS LAST, f.code ASC`
       : params.sort === "name"
         ? Prisma.sql`f.name ASC, f.code ASC`
-        : Prisma.sql`latest.dailyGrowthRate DESC NULLS LAST, f.code ASC`;
+        : params.sort === "return_desc"
+          ? Prisma.sql`selectedRank.rankValue DESC NULLS LAST, f.code ASC`
+          : params.sort === "return_asc"
+            ? Prisma.sql`selectedRank.rankValue ASC NULLS LAST, f.code ASC`
+            : params.sort === "drawdown_desc"
+              ? Prisma.sql`risk.maxDrawdown DESC NULLS LAST, f.code ASC`
+              : Prisma.sql`latest.dailyGrowthRate DESC NULLS LAST, f.code ASC`;
 
   const rows = await prisma.$queryRaw<FundListItem[]>`
+    ${riskWithSql}
     SELECT
       f.code,
       f.name,
@@ -654,6 +779,11 @@ export async function getFundList(params: {
       latest.dailyGrowthValue,
       latest.dailyGrowthRate,
       latest.growthRateSource,
+      ${returnRange} AS selectedReturnRange,
+      selectedRank.rankDate AS selectedReturnDate,
+      selectedRank.rankValue AS selectedReturn,
+      ${riskSelectSql} AS maxDrawdown,
+      NULL AS volatility,
       CASE WHEN w.id IS NULL THEN 0 ELSE 1 END AS watched
     FROM Fund f
     LEFT JOIN FundNavDaily latest
@@ -663,6 +793,14 @@ export async function getFundList(params: {
         ORDER BY nav.tradeDate DESC
         LIMIT 1
       )
+    LEFT JOIN FundRankDaily selectedRank
+      ON selectedRank.id = (
+        SELECT id FROM FundRankDaily rankRow
+        WHERE rankRow.fundCode = f.code AND rankRow.rangeKey = ${returnRange}
+        ORDER BY rankRow.rankDate DESC, rankRow.createdAt DESC
+        LIMIT 1
+      )
+    ${riskJoinSql}
     LEFT JOIN Watchlist w
       ON w.targetType = 'fund' AND w.fundCode = f.code
     ${whereSql}
@@ -677,6 +815,7 @@ export async function getFundList(params: {
   }));
 
   const totalRows = await prisma.$queryRaw<Array<{ total: number }>>`
+    ${riskWithSql}
     SELECT COUNT(*) AS total
     FROM Fund f
     LEFT JOIN FundNavDaily latest
@@ -686,13 +825,21 @@ export async function getFundList(params: {
         ORDER BY nav.tradeDate DESC
         LIMIT 1
       )
+    LEFT JOIN FundRankDaily selectedRank
+      ON selectedRank.id = (
+        SELECT id FROM FundRankDaily rankRow
+        WHERE rankRow.fundCode = f.code AND rankRow.rangeKey = ${returnRange}
+        ORDER BY rankRow.rankDate DESC, rankRow.createdAt DESC
+        LIMIT 1
+      )
+    ${riskJoinSql}
     ${whereSql}
   `;
 
   const total = Number(totalRows[0]?.total ?? 0);
 
   return {
-    items,
+    items: await attachFundListRiskMetrics(items),
     total,
     page,
     pageSize,

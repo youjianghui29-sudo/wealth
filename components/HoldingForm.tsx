@@ -2,7 +2,15 @@
 
 import { FormEvent, useState } from "react";
 
-export function HoldingForm() {
+export function HoldingForm({
+  defaultTargetType = "fund",
+  defaultTargetKey,
+  defaultCostPrice
+}: {
+  defaultTargetType?: "fund" | "wealth";
+  defaultTargetKey?: string;
+  defaultCostPrice?: string;
+}) {
   const [message, setMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -29,14 +37,26 @@ export function HoldingForm() {
     <form className="rounded-md border border-line bg-white p-4 shadow-panel" onSubmit={submit}>
       <h2 className="text-lg font-semibold text-ink">添加或更新持仓</h2>
       <div className="mt-4 grid gap-3 md:grid-cols-[120px_1fr_120px_120px_120px_150px]">
-        <select name="targetType" className="focus-ring rounded-md border border-line px-3 py-2" defaultValue="fund">
+        <select name="targetType" className="focus-ring rounded-md border border-line px-3 py-2" defaultValue={defaultTargetType}>
           <option value="fund">基金</option>
           <option value="wealth">理财</option>
         </select>
-        <input name="targetKey" className="focus-ring rounded-md border border-line px-3 py-2" placeholder="基金代码或理财登记编码" required />
+        <input
+          name="targetKey"
+          className="focus-ring rounded-md border border-line px-3 py-2"
+          placeholder="基金代码或理财登记编码"
+          defaultValue={defaultTargetKey}
+          required
+        />
         <input name="shares" className="focus-ring rounded-md border border-line px-3 py-2" placeholder="份额" inputMode="decimal" />
         <input name="costAmount" className="focus-ring rounded-md border border-line px-3 py-2" placeholder="成本金额" inputMode="decimal" />
-        <input name="costPrice" className="focus-ring rounded-md border border-line px-3 py-2" placeholder="成本单价" inputMode="decimal" />
+        <input
+          name="costPrice"
+          className="focus-ring rounded-md border border-line px-3 py-2"
+          placeholder="成本单价"
+          inputMode="decimal"
+          defaultValue={defaultCostPrice}
+        />
         <input name="purchaseDate" className="focus-ring rounded-md border border-line px-3 py-2" type="date" />
       </div>
       <textarea name="note" className="focus-ring mt-3 min-h-20 w-full rounded-md border border-line px-3 py-2" placeholder="备注：买入理由、赎回计划、风险关注点" />

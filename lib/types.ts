@@ -10,6 +10,11 @@ export type FundListItem = {
   dailyGrowthValue: number | null;
   dailyGrowthRate: number | null;
   growthRateSource: string | null;
+  selectedReturnRange: string | null;
+  selectedReturnDate: Date | string | null;
+  selectedReturn: number | null;
+  maxDrawdown: number | null;
+  volatility: number | null;
   watched: number | boolean;
 };
 
