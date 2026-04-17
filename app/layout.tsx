@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { CompareTray } from "@/components/CompareTray";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -90,6 +91,7 @@ export default function RootLayout({
           </div>
         </header>
         <main className="mx-auto max-w-7xl px-4 py-6 lg:px-6">{children}</main>
+        <CompareTray />
         <footer className="mx-auto max-w-7xl px-4 pb-8 pt-2 text-sm text-slate-600 lg:px-6">
           数据仅供学习和信息展示，不构成投资建议。中国理财网公开披露内容仅按内部/非商业 MVP 使用。
         </footer>

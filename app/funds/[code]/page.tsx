@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import type { ReactNode } from "react";
 import Link from "next/link";
+import { AddCompareButton } from "@/components/CompareTray";
 import { NavChart } from "@/components/NavChart";
 import { TrendBadge } from "@/components/TrendBadge";
 import { WatchButton } from "@/components/WatchButton";
@@ -12,6 +13,17 @@ export const dynamic = "force-dynamic";
 type PageProps = {
   params: Promise<{ code: string }>;
 };
+
+function isOpenForPurchase(status: string | null | undefined) {
+  if (!status) {
+    return false;
+  }
+  const normalized = status.replace(/\s/g, "");
+  return (
+    (normalized.includes("开放") || normalized.includes("申购")) &&
+    !/(暂停|封闭|停止|不可|限制)/.test(normalized)
+  );
+}
 
 export default async function FundDetailPage({ params }: PageProps) {
   const { code } = await params;
@@ -27,6 +39,21 @@ export default async function FundDetailPage({ params }: PageProps) {
     value: nav.unitNav,
     changeRate: nav.dailyGrowthRate
   }));
+  const oneYearReturn = fund.periodReturns.find((item) => item.rangeKey === "year_1");
+  const purchaseOpen = isOpenForPurchase(fund.purchaseStatus);
+  const profileReady = Boolean(fund.profile);
+  const feeReady = fund.fees.length > 0;
+  const drawdownOk =
+    fund.riskMetrics.maxDrawdown === null || fund.riskMetrics.maxDrawdown === undefined
+      ? null
+      : fund.riskMetrics.maxDrawdown >= -10;
+  const holdingParams = new URLSearchParams({
+    targetType: "fund",
+    targetKey: fund.code
+  });
+  if (latest?.unitNav) {
+    holdingParams.set("costPrice", String(latest.unitNav));
+  }
 
   return (
     <div className="space-y-5">
@@ -48,6 +75,66 @@ export default async function FundDetailPage({ params }: PageProps) {
           <WatchButton targetType="fund" code={fund.code} initialWatched={fund.watched} />
         </div>
       </div>
+
+      <section className="rounded-md border border-line bg-white p-4 shadow-panel">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-ink">买入决策面板</h2>
+            <p className="mt-1 text-sm text-slate-600">先核对交易状态、收益样本、回撤压力和费用规模，再决定是否记录买入计划。</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Link
+              href={`/portfolio?${holdingParams.toString()}`}
+              className="focus-ring rounded-md bg-ink px-4 py-2 text-sm font-medium text-white"
+            >
+              记录买入
+            </Link>
+            <AddCompareButton targetType="fund" targetKey={fund.code} name={fund.name} />
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <DecisionMetric
+            label="申购状态"
+            value={fund.purchaseStatus ?? "--"}
+            helper={purchaseOpen ? "当前状态允许继续核对买入" : "买入前先确认销售平台是否可申购"}
+          />
+          <DecisionMetric
+            label="近1年收益"
+            value={<TrendBadge value={oneYearReturn?.rankValue} />}
+            helper={`排行日 ${formatDate(oneYearReturn?.rankDate)}`}
+          />
+          <DecisionMetric
+            label="样本最大回撤"
+            value={fund.riskMetrics.maxDrawdown === null ? "--" : `${formatNumber(fund.riskMetrics.maxDrawdown, 2)}%`}
+            helper="越接近 0，样本期跌幅压力越低"
+          />
+          <DecisionMetric
+            label="费用 / 规模"
+            value={fund.fees[0]?.feeValue ?? "--"}
+            helper={`规模 ${fund.profile?.latestScale ?? "--"}`}
+          />
+        </div>
+
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <ChecklistItem label="可申购" status={purchaseOpen ? "ok" : "warn"} detail={fund.purchaseStatus ?? "未披露"} />
+          <ChecklistItem
+            label="回撤可承受"
+            status={drawdownOk === null ? "missing" : drawdownOk ? "ok" : "warn"}
+            detail={drawdownOk === null ? "净值样本不足" : drawdownOk ? "样本回撤未超过 10%" : "样本回撤超过 10%"}
+          />
+          <ChecklistItem
+            label="收益样本可读"
+            status={oneYearReturn?.rankValue === null || oneYearReturn?.rankValue === undefined ? "missing" : "ok"}
+            detail={oneYearReturn?.rankValue === null || oneYearReturn?.rankValue === undefined ? "缺少近1年收益" : "已接入近1年排行"}
+          />
+          <ChecklistItem
+            label="资料与费率"
+            status={profileReady && feeReady ? "ok" : "missing"}
+            detail={profileReady && feeReady ? "资料和费率已采集" : "资料或费率仍需补采"}
+          />
+        </div>
+      </section>
 
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Info label="最新净值" value={formatNumber(latest?.unitNav)} />
@@ -242,6 +329,40 @@ function Field({ label, value }: { label: string; value: ReactNode }) {
     <div>
       <div className="text-slate-500">{label}</div>
       <div className="mt-1 font-medium text-ink">{value || "--"}</div>
+    </div>
+  );
+}
+
+function DecisionMetric({ label, value, helper }: { label: string; value: ReactNode; helper: string }) {
+  return (
+    <div className="rounded-md border border-line bg-paper p-3">
+      <div className="text-sm text-slate-600">{label}</div>
+      <div className="mt-2 text-lg font-semibold text-ink">{value}</div>
+      <div className="mt-1 text-xs text-slate-500">{helper}</div>
+    </div>
+  );
+}
+
+function ChecklistItem({
+  label,
+  status,
+  detail
+}: {
+  label: string;
+  status: "ok" | "warn" | "missing";
+  detail: string;
+}) {
+  const className =
+    status === "ok"
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : status === "warn"
+        ? "border-amber-200 bg-amber-50 text-amber-700"
+        : "border-slate-200 bg-slate-50 text-slate-600";
+
+  return (
+    <div className={`rounded-md border px-3 py-2 text-sm ${className}`}>
+      <div className="font-medium">{label}</div>
+      <div className="mt-1 text-xs">{detail}</div>
     </div>
   );
 }

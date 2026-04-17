@@ -7,7 +7,17 @@ import { getPortfolioDashboard } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
 
-export default async function PortfolioPage() {
+type PageProps = {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+};
+
+function single(value: string | string[] | undefined) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+export default async function PortfolioPage({ searchParams }: PageProps) {
+  const rawParams = await searchParams;
+  const targetType = single(rawParams.targetType) === "wealth" ? "wealth" : "fund";
   const dashboard = await getPortfolioDashboard();
 
   return (
@@ -24,7 +34,11 @@ export default async function PortfolioPage() {
         <MetricCard label="今日盈亏" value={`¥${formatNumber(dashboard.summary.dailyProfit, 2)}`} helper="按相邻净值估算" />
       </section>
 
-      <HoldingForm />
+      <HoldingForm
+        defaultTargetType={targetType}
+        defaultTargetKey={single(rawParams.targetKey)}
+        defaultCostPrice={single(rawParams.costPrice)}
+      />
 
       <section className="rounded-md border border-line bg-white shadow-panel">
         <div className="border-b border-line px-4 py-3 text-sm text-slate-600">共 {dashboard.items.length} 个持仓标的</div>
