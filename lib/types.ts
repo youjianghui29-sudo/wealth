@@ -2,6 +2,8 @@ export type FundListItem = {
   code: string;
   name: string;
   fundType: string | null;
+  fundTypeSource?: string | null;
+  assetMode?: string | null;
   purchaseStatus: string | null;
   redeemStatus: string | null;
   tradeDate: Date | string | null;
@@ -15,6 +17,12 @@ export type FundListItem = {
   selectedReturn: number | null;
   maxDrawdown: number | null;
   volatility: number | null;
+  dataCompleteness: number | null;
+  dataQualityLabel?: string | null;
+  missingActions?: string[];
+  navSampleCount: number | null;
+  hasProfile: number | boolean | null;
+  hasFee: number | boolean | null;
   watched: number | boolean;
 };
 
@@ -33,6 +41,7 @@ export type WealthListItem = {
   accumulatedValue: number | null;
   dailyChange: number | null;
   dailyChangeRate: number | null;
+  navStatus: string | null;
   watched: number | boolean;
 };
 
@@ -59,6 +68,41 @@ export type FundRankingItem = {
   rankValue: number | null;
   unitNav: number | null;
   dailyGrowthRate: number | null;
+};
+
+export type FundCandidateItem = {
+  code: string;
+  name: string;
+  fundType: string | null;
+  assetMode: string | null;
+  tradeDate: Date | string | null;
+  unitNav: number | null;
+  dailyGrowthRate: number | null;
+  weekReturn: number | null;
+  month3Return: number | null;
+  month6Return: number | null;
+  year1Return: number | null;
+  peerPercentile: number | null;
+  maxDrawdown: number | null;
+  volatility: number | null;
+  dataScore: number;
+  observationScore: number;
+  navSampleCount: number;
+  hasProfile: boolean;
+  hasFee: boolean;
+  highImpactAnnouncementCount: number;
+  purchaseStatus: string | null;
+  watched: boolean;
+  reasons: string[];
+  risks: string[];
+};
+
+export type FundCandidateSummary = {
+  totalScanned: number;
+  strongCount: number;
+  watchableCount: number;
+  cautiousCount: number;
+  generatedAt: string;
 };
 
 export type MoneyFundItem = {

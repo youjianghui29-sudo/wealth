@@ -22,6 +22,7 @@ export default async function WealthPage({ searchParams }: PageProps) {
     riskLevel: single(rawParams.riskLevel),
     operationMode: single(rawParams.operationMode),
     direction: single(rawParams.direction),
+    dataStatus: single(rawParams.dataStatus),
     sort: single(rawParams.sort),
     page: single(rawParams.page)
   };
@@ -36,7 +37,14 @@ export default async function WealthPage({ searchParams }: PageProps) {
         </p>
       </div>
 
-      <form className="grid gap-3 rounded-md border border-line bg-white p-4 shadow-panel md:grid-cols-[1fr_160px_120px_150px_140px_140px_100px]">
+      <section className="grid gap-3 md:grid-cols-3">
+        <StatusLink label="有净值涨跌" href="/wealth?dataStatus=with_change" active={params.dataStatus === "with_change"} note="可直接看净值变化率" />
+        <StatusLink label="只有净值" href="/wealth?dataStatus=net_value_only" active={params.dataStatus === "net_value_only"} note="有最新净值但缺少涨跌" />
+        <StatusLink label="仅披露信息" href="/wealth?dataStatus=disclosure_only" active={params.dataStatus === "disclosure_only"} note="暂不能计算净值涨跌" />
+      </section>
+
+      <form className="grid gap-3 rounded-md border border-line bg-white p-4 shadow-panel md:grid-cols-[1fr_160px_120px_150px_140px_140px_140px_100px]">
+        {params.dataStatus ? <input type="hidden" name="dataStatus" value={params.dataStatus} /> : null}
         <input
           name="q"
           defaultValue={params.q}
@@ -86,6 +94,9 @@ export default async function WealthPage({ searchParams }: PageProps) {
           <option value="change_asc">跌幅优先</option>
           <option value="name">名称排序</option>
         </select>
+        <Link href="/wealth" className="focus-ring rounded-md border border-line px-4 py-2 text-center text-slate-700">
+          重置
+        </Link>
         <button className="focus-ring rounded-md bg-ink px-4 py-2 text-white" type="submit">
           筛选
         </button>
@@ -105,6 +116,7 @@ export default async function WealthPage({ searchParams }: PageProps) {
                 <th className="px-4 py-3 font-medium">运作模式</th>
                 <th className="px-4 py-3 text-right font-medium">最新净值</th>
                 <th className="px-4 py-3 text-right font-medium">净值变化</th>
+                <th className="px-4 py-3 font-medium">数据状态</th>
                 <th className="px-4 py-3 font-medium">净值日</th>
               </tr>
             </thead>
@@ -127,6 +139,7 @@ export default async function WealthPage({ searchParams }: PageProps) {
                   <td className="px-4 py-3 text-right">
                     <TrendBadge value={row.dailyChangeRate} />
                   </td>
+                  <td className="px-4 py-3 text-slate-600">{navStatusLabel(row.navStatus)}</td>
                   <td className="px-4 py-3 text-slate-600">{formatDate(row.navDate)}</td>
                 </tr>
               ))}
@@ -144,9 +157,44 @@ export default async function WealthPage({ searchParams }: PageProps) {
           riskLevel: params.riskLevel,
           operationMode: params.operationMode,
           direction: params.direction,
+          dataStatus: params.dataStatus,
           sort: params.sort
         }}
       />
     </div>
+  );
+}
+
+function navStatusLabel(value: string | null) {
+  if (value === "with_change") {
+    return "有净值涨跌";
+  }
+  if (value === "net_value_only") {
+    return "只有净值";
+  }
+  return "仅披露信息";
+}
+
+function StatusLink({
+  label,
+  href,
+  active,
+  note
+}: {
+  label: string;
+  href: string;
+  active: boolean;
+  note: string;
+}) {
+  return (
+    <Link
+      href={href}
+      className={`focus-ring rounded-md border p-3 text-sm ${
+        active ? "border-ink bg-ink text-white" : "border-line bg-white text-slate-700"
+      }`}
+    >
+      <span className="block font-medium">{label}</span>
+      <span className={`mt-1 block text-xs ${active ? "text-white/75" : "text-slate-500"}`}>{note}</span>
+    </Link>
   );
 }

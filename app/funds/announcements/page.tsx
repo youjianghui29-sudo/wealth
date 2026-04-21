@@ -16,6 +16,7 @@ type AnnouncementRow = {
   source: string | null;
   publishedAt: Date | string | null;
   url: string;
+  impact?: { level: string; label: string; reason: string };
   fund?: { name: string | null } | null;
 };
 
@@ -28,6 +29,12 @@ function sourceLabel(source: string | null | undefined) {
   if (source === "akshare-dividend") return "分红公告";
   if (source === "akshare-personnel") return "人事调整";
   return source ?? "--";
+}
+
+function impactClass(level: string | undefined) {
+  if (level === "high") return "bg-coral/10 text-coral";
+  if (level === "medium") return "bg-steel/10 text-steel";
+  return "bg-mint/10 text-mint";
 }
 
 export default async function FundAnnouncementsPage({ searchParams }: PageProps) {
@@ -44,7 +51,7 @@ export default async function FundAnnouncementsPage({ searchParams }: PageProps)
     <div className="space-y-5">
       <div>
         <h1 className="text-2xl font-semibold text-ink">基金公告中心</h1>
-        <p className="mt-2 text-sm text-slate-600">按定期报告、分红公告、人事调整集中查看基金公告。</p>
+        <p className="mt-2 text-sm text-slate-600">按公告类型和影响级别查看基金公告，高影响公告优先核对交易、费率、经理和产品存续。</p>
       </div>
 
       <form className="grid gap-3 rounded-md border border-line bg-white p-4 shadow-panel md:grid-cols-[1fr_200px_100px]">
@@ -73,6 +80,7 @@ export default async function FundAnnouncementsPage({ searchParams }: PageProps)
               <tr>
                 <th className="px-4 py-3 font-medium">基金</th>
                 <th className="px-4 py-3 font-medium">标题</th>
+                <th className="px-4 py-3 font-medium">影响</th>
                 <th className="px-4 py-3 font-medium">类型</th>
                 <th className="px-4 py-3 font-medium">日期</th>
                 <th className="px-4 py-3 font-medium">链接</th>
@@ -81,7 +89,7 @@ export default async function FundAnnouncementsPage({ searchParams }: PageProps)
             <tbody className="divide-y divide-line">
               {items.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="px-4 py-6 text-center text-slate-500">
+                  <td colSpan={6} className="px-4 py-6 text-center text-slate-500">
                     暂无匹配公告
                   </td>
                 </tr>
@@ -98,6 +106,12 @@ export default async function FundAnnouncementsPage({ searchParams }: PageProps)
                       <div className="mt-1 text-xs text-slate-500">{row.fundCode ?? "--"}</div>
                     </td>
                     <td className="px-4 py-3 text-slate-700">{row.title}</td>
+                    <td className="px-4 py-3">
+                      <span className={`rounded-md px-2 py-1 text-xs font-medium ${impactClass(row.impact?.level)}`}>
+                        {row.impact?.label ?? "低影响"}
+                      </span>
+                      <div className="mt-1 text-xs text-slate-500">{row.impact?.reason ?? "普通公告"}</div>
+                    </td>
                     <td className="px-4 py-3 text-slate-600">{sourceLabel(row.source)}</td>
                     <td className="px-4 py-3 text-slate-600">{formatDate(row.publishedAt)}</td>
                     <td className="px-4 py-3">

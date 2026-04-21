@@ -367,11 +367,46 @@ model PortfolioHolding {
   updatedAt    DateTime       @updatedAt
   fund         Fund?          @relation(fields: [fundCode], references: [code], onDelete: Cascade)
   product      WealthProduct? @relation(fields: [registerCode], references: [registerCode], onDelete: Cascade)
+  transactions PortfolioTransaction[]
 
   @@unique([targetType, targetKey])
   @@index([targetType])
   @@index([fundCode])
   @@index([registerCode])
+}
+
+model PortfolioTransaction {
+  id              Int               @id @default(autoincrement())
+  holdingId       Int?
+  targetType      String
+  targetKey       String
+  transactionType String
+  tradeDate       DateTime
+  shares          Float?
+  price           Float?
+  amount          Float?
+  fee             Float?
+  note            String?
+  createdAt       DateTime          @default(now())
+  holding         PortfolioHolding? @relation(fields: [holdingId], references: [id], onDelete: Cascade)
+
+  @@index([holdingId])
+  @@index([targetType, targetKey])
+  @@index([tradeDate])
+  @@index([transactionType])
+}
+
+model PortfolioTarget {
+  id           Int      @id @default(autoincrement())
+  targetKey    String   @unique
+  label        String
+  targetWeight Float?
+  maxWeight    Float?
+  note         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([targetKey])
 }
 
 model AlertRule {

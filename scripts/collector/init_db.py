@@ -358,6 +358,41 @@ SCHEMA_SQL = [
     "CREATE INDEX IF NOT EXISTS PortfolioHolding_fundCode_idx ON PortfolioHolding(fundCode)",
     "CREATE INDEX IF NOT EXISTS PortfolioHolding_registerCode_idx ON PortfolioHolding(registerCode)",
     """
+    CREATE TABLE IF NOT EXISTS PortfolioTransaction (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      holdingId INTEGER,
+      targetType TEXT NOT NULL,
+      targetKey TEXT NOT NULL,
+      transactionType TEXT NOT NULL,
+      tradeDate DATETIME NOT NULL,
+      shares REAL,
+      price REAL,
+      amount REAL,
+      fee REAL,
+      note TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT PortfolioTransaction_holdingId_fkey FOREIGN KEY (holdingId) REFERENCES PortfolioHolding(id) ON DELETE CASCADE ON UPDATE CASCADE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS PortfolioTransaction_holdingId_idx ON PortfolioTransaction(holdingId)",
+    "CREATE INDEX IF NOT EXISTS PortfolioTransaction_targetType_targetKey_idx ON PortfolioTransaction(targetType, targetKey)",
+    "CREATE INDEX IF NOT EXISTS PortfolioTransaction_tradeDate_idx ON PortfolioTransaction(tradeDate)",
+    "CREATE INDEX IF NOT EXISTS PortfolioTransaction_transactionType_idx ON PortfolioTransaction(transactionType)",
+    """
+    CREATE TABLE IF NOT EXISTS PortfolioTarget (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      targetKey TEXT NOT NULL,
+      label TEXT NOT NULL,
+      targetWeight REAL,
+      maxWeight REAL,
+      note TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS PortfolioTarget_targetKey_key ON PortfolioTarget(targetKey)",
+    "CREATE INDEX IF NOT EXISTS PortfolioTarget_targetKey_idx ON PortfolioTarget(targetKey)",
+    """
     CREATE TABLE IF NOT EXISTS AlertRule (
       id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
       targetType TEXT NOT NULL,

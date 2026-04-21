@@ -6,12 +6,16 @@ build/
 .env
 *.sqlite
 *.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
 *.db
 *.db-journal
 __pycache__/
 .venv/
 venv/
 data/wealth.sqlite
+data/*.log
+data/reports/
 data/raw/
 data/logs/
 *.tsbuildinfo

@@ -11,6 +11,7 @@ export async function GET(request: NextRequest) {
     riskLevel: searchParams.get("riskLevel"),
     operationMode: searchParams.get("operationMode"),
     direction: searchParams.get("direction"),
+    dataStatus: searchParams.get("dataStatus"),
     sort: searchParams.get("sort"),
     page: searchParams.get("page"),
     pageSize: searchParams.get("pageSize")

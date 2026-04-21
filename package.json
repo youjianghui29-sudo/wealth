@@ -12,6 +12,8 @@
     "collect:seed": "python scripts/collector/run_daily.py --seed",
     "collect:backfill": "python scripts/collector/run_backfill.py",
     "collect:backfill:full": "python scripts/collector/run_backfill.py --full",
+    "collect:fix-fund-types": "python scripts/collector/fix_fund_types.py",
+    "collect:fund-profile-batches": "python scripts/collector/run_fund_profile_batches.py",
     "collect:fund-profiles": "python scripts/collector/run_fund_profiles.py --limit 23030",
     "collect:fund-extras": "python scripts/collector/run_fund_extras.py",
     "collect:fund-dividends": "python scripts/collector/run_fund_dividends.py"
