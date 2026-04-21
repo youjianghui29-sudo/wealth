@@ -10,6 +10,7 @@ export async function GET(request: NextRequest) {
     type: searchParams.get("type"),
     direction: searchParams.get("direction"),
     purchaseStatus: searchParams.get("purchaseStatus"),
+    view: searchParams.get("view"),
     returnRange: searchParams.get("returnRange"),
     minReturn: searchParams.get("minReturn"),
     maxDrawdown: searchParams.get("maxDrawdown"),

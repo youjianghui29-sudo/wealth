@@ -1,7 +1,11 @@
 import { Prisma } from "@prisma/client";
-import { prisma } from "@/lib/prisma";
+import { buildFundDataCoverage } from "@/lib/data-quality";
+import { classifyFund, fundTypeFilterSqlHint } from "@/lib/fund-classification";
+import { ensureSqlitePragmas, prisma } from "@/lib/prisma";
 import type {
   ExchangeFundItem,
+  FundCandidateItem,
+  FundCandidateSummary,
   FundListItem,
   FundRankingItem,
   MoneyFundItem,
@@ -31,6 +35,13 @@ const FUND_LIST_RETURN_RANGES = [
   "year_to_date",
   "since_inception"
 ];
+const DEFAULT_PORTFOLIO_TARGETS = [
+  { targetKey: "fund", label: "基金资产", targetWeight: 60, maxWeight: null, note: "权益/债券/货币基金合计" },
+  { targetKey: "wealth", label: "银行理财", targetWeight: 30, maxWeight: null, note: "银行理财和固收类产品" },
+  { targetKey: "cash", label: "现金留存", targetWeight: 10, maxWeight: null, note: "页面未接入现金账户时按 0 计算" },
+  { targetKey: "single_position", label: "单一持仓上限", targetWeight: null, maxWeight: 30, note: "任意单只基金或理财占比" },
+  { targetKey: "industry", label: "单一行业上限", targetWeight: null, maxWeight: 35, note: "基金持仓穿透后的行业暴露" }
+];
 
 type AlertItem = {
   level: "high" | "medium" | "low";
@@ -40,6 +51,20 @@ type AlertItem = {
   message: string;
   metric: string;
 };
+
+function classifyAnnouncementImpact(title: string | null | undefined, source: string | null | undefined) {
+  const text = `${title ?? ""} ${source ?? ""}`;
+  if (/清盘|终止上市|终止基金合同|基金合同终止|基金经理变更|变更基金经理|更换基金经理|离任|暂停申购|暂停赎回|限制大额|大额申购|费率调整|调整费率|降低费率|提高费率/.test(text)) {
+    return { level: "high", label: "高影响", reason: "可能影响交易、费率、经理或产品存续" };
+  }
+  if (/分红|派息|恢复大额|恢复申购|持有人大会|开放申购|开放赎回|暂停大额/.test(text)) {
+    return { level: "medium", label: "中影响", reason: "可能影响现金流、开放安排或持有人权益" };
+  }
+  if (/定期报告|季度报告|中期报告|年度报告|招募说明书|产品资料概要/.test(text)) {
+    return { level: "low", label: "低影响", reason: "常规披露，适合复核持仓和规模变化" };
+  }
+  return { level: "low", label: "低影响", reason: "普通公告" };
+}
 
 function toPositiveInt(value: string | number | undefined | null, fallback: number) {
   const parsed = Number(value);
@@ -59,6 +84,41 @@ function optionalNumber(value: string | number | undefined | null) {
 
 function clampPageSize(value: string | number | undefined | null) {
   return Math.min(toPositiveInt(value, DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
+}
+
+function fundTypeFilter(type: string) {
+  const normalized = fundTypeFilterSqlHint(type);
+  if (normalized === "ETF") {
+    return Prisma.sql`(f.fundType = 'ETF' OR f.name LIKE '%ETF%')`;
+  }
+  if (normalized === "LOF") {
+    return Prisma.sql`(f.fundType = 'LOF' OR f.name LIKE '%LOF%')`;
+  }
+  if (normalized === "QDII") {
+    return Prisma.sql`(f.fundType = 'QDII' OR f.name LIKE '%QDII%' OR f.name LIKE '%全球%' OR f.name LIKE '%海外%' OR f.name LIKE '%纳斯达克%' OR f.name LIKE '%标普%' OR f.name LIKE '%恒生%')`;
+  }
+  if (normalized === "FOF") {
+    return Prisma.sql`(f.fundType = 'FOF' OR f.name LIKE '%FOF%' OR f.name LIKE '%养老目标%' OR f.name LIKE '%目标日期%')`;
+  }
+  if (normalized === "REITs") {
+    return Prisma.sql`(f.fundType = 'REITs' OR f.name LIKE '%REIT%' OR f.name LIKE '%基础设施%')`;
+  }
+  if (normalized === "货币型") {
+    return Prisma.sql`(f.fundType = '货币型' OR f.name LIKE '%货币%' OR f.name LIKE '%现金%' OR f.name LIKE '%余额%' OR f.name LIKE '%天天%')`;
+  }
+  if (normalized === "债券型") {
+    return Prisma.sql`(f.fundType = '债券型' OR f.name LIKE '%债券%' OR f.name LIKE '%纯债%' OR f.name LIKE '%短债%' OR f.name LIKE '%中短债%' OR f.name LIKE '%转债%')`;
+  }
+  if (normalized === "指数型") {
+    return Prisma.sql`(f.fundType = '指数型' OR f.name LIKE '%指数%' OR f.name LIKE '%联接%' OR f.name LIKE '%增强%' OR f.name LIKE '%沪深%' OR f.name LIKE '%中证%')`;
+  }
+  if (normalized === "股票型") {
+    return Prisma.sql`(f.fundType = '股票型' OR f.name LIKE '%股票%' OR f.name LIKE '%量化%')`;
+  }
+  if (normalized === "混合型") {
+    return Prisma.sql`(f.fundType = '混合型' OR f.name LIKE '%混合%' OR f.name LIKE '%灵活%' OR f.name LIKE '%优选%' OR f.name LIKE '%精选%' OR f.name LIKE '%成长%' OR f.name LIKE '%价值%')`;
+  }
+  return Prisma.sql`f.fundType = ${type}`;
 }
 
 function toDate(value: Date | string | null | undefined) {
@@ -133,6 +193,207 @@ function calculateRiskMetrics(
     volatility,
     sharpe,
     annualizedReturn
+  };
+}
+
+function normalizeFundBaseName(name: string) {
+  return name
+    .replace(/\s+/g, "")
+    .replace(/(?:人民币)?(?:前端|后端)?(?:A|B|C|D|E|I|Y)(?:类|份额)?$/i, "")
+    .replace(/(?:A类|B类|C类|D类|E类|I类|Y类)$/i, "")
+    .replace(/(?:联接|链接)?(?:A|C)$/i, "")
+    .trim();
+}
+
+function inferShareClass(name: string) {
+  const normalized = name.replace(/\s+/g, "");
+  const match = normalized.match(/(?:人民币)?(?:前端|后端)?([A-Z])(?:类|份额)?$/i);
+  if (match?.[1]) {
+    return match[1].toUpperCase();
+  }
+  return "--";
+}
+
+function parsePercentRate(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  const match = value.replace(/,/g, "").match(/([0-9]+(?:\.[0-9]+)?)\s*%/);
+  if (!match) {
+    return null;
+  }
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function summarizeFeeRows(
+  fees: Array<{ feeType: string | null; conditionName: string | null; feeValue: string | null }>
+) {
+  let subscriptionRate: number | null = null;
+  let serviceRate: number | null = null;
+  let managementRate: number | null = null;
+  let custodyRate: number | null = null;
+  let redemptionRate: number | null = null;
+  let firstFee: string | null = null;
+
+  for (const fee of fees) {
+    const feeText = `${fee.feeType ?? ""}${fee.conditionName ?? ""}`;
+    const value = parsePercentRate(fee.feeValue);
+    if (!firstFee && fee.feeValue) {
+      firstFee = `${fee.feeType ?? "费用"} ${fee.conditionName ?? ""} ${fee.feeValue}`.trim();
+    }
+    if (value === null) {
+      continue;
+    }
+    if (/申购|认购/.test(feeText)) {
+      subscriptionRate = subscriptionRate === null ? value : Math.min(subscriptionRate, value);
+    } else if (/销售服务/.test(feeText)) {
+      serviceRate = serviceRate === null ? value : Math.max(serviceRate, value);
+    } else if (/管理/.test(feeText)) {
+      managementRate = managementRate === null ? value : Math.max(managementRate, value);
+    } else if (/托管/.test(feeText)) {
+      custodyRate = custodyRate === null ? value : Math.max(custodyRate, value);
+    } else if (/赎回/.test(feeText)) {
+      redemptionRate = redemptionRate === null ? value : Math.max(redemptionRate, value);
+    }
+  }
+
+  return {
+    subscriptionRate,
+    serviceRate,
+    managementRate,
+    custodyRate,
+    redemptionRate,
+    firstFee
+  };
+}
+
+function estimateClassCost(
+  feeSummary: ReturnType<typeof summarizeFeeRows>,
+  holdingDays: number,
+  amount = 10000
+) {
+  const subscriptionCost = amount * ((feeSummary.subscriptionRate ?? 0) / 100);
+  const serviceCost = amount * ((feeSummary.serviceRate ?? 0) / 100) * (holdingDays / 365);
+  return subscriptionCost + serviceCost;
+}
+
+function buildShareClassBreakEven(
+  items: Array<{
+    code: string;
+    name: string;
+    shareClass: string;
+    feeSummary: ReturnType<typeof summarizeFeeRows>;
+    cost30d: number;
+    cost365d: number;
+  }>
+) {
+  const aClass = items.find((item) => item.shareClass === "A");
+  const cClass = items.find((item) => item.shareClass === "C");
+  if (!aClass || !cClass) {
+    return null;
+  }
+
+  const aSubscription = aClass.feeSummary.subscriptionRate ?? 0;
+  const cSubscription = cClass.feeSummary.subscriptionRate ?? 0;
+  const aService = aClass.feeSummary.serviceRate ?? 0;
+  const cService = cClass.feeSummary.serviceRate ?? 0;
+  const serviceDiff = cService - aService;
+  const subscriptionDiff = aSubscription - cSubscription;
+  const breakEvenDays = serviceDiff > 0 && subscriptionDiff > 0 ? (subscriptionDiff / serviceDiff) * 365 : null;
+  const cheapest = (days: number) => {
+    const aCost = estimateClassCost(aClass.feeSummary, days);
+    const cCost = estimateClassCost(cClass.feeSummary, days);
+    return aCost <= cCost
+      ? { shareClass: "A", code: aClass.code, cost: aCost }
+      : { shareClass: "C", code: cClass.code, cost: cCost };
+  };
+
+  return {
+    aCode: aClass.code,
+    cCode: cClass.code,
+    breakEvenDays,
+    better30d: cheapest(30),
+    better90d: cheapest(90),
+    better365d: cheapest(365)
+  };
+}
+
+function monthKey(value: Date | string) {
+  const date = toDate(value);
+  if (!date) {
+    return "";
+  }
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function buildInvestmentSimulation(
+  navs: Array<{ tradeDate: Date | string; unitNav: number | null }>,
+  monthlyAmount = 1000
+) {
+  const points = navs.filter((item) => item.unitNav !== null && item.unitNav !== undefined && item.unitNav > 0);
+  if (points.length < 2) {
+    return null;
+  }
+
+  const buys: typeof points = [];
+  const seenMonths = new Set<string>();
+  for (const point of points) {
+    const key = monthKey(point.tradeDate);
+    if (!key || seenMonths.has(key)) {
+      continue;
+    }
+    seenMonths.add(key);
+    buys.push(point);
+  }
+
+  if (buys.length < 2) {
+    return null;
+  }
+
+  const latest = points.at(-1);
+  if (!latest?.unitNav) {
+    return null;
+  }
+
+  let shares = 0;
+  let invested = 0;
+  let buyIndex = 0;
+  let maxFloatingLoss = 0;
+
+  for (const point of points) {
+    while (buyIndex < buys.length && buys[buyIndex] === point) {
+      shares += monthlyAmount / Number(point.unitNav);
+      invested += monthlyAmount;
+      buyIndex += 1;
+    }
+    if (invested > 0 && point.unitNav) {
+      const value = shares * point.unitNav;
+      maxFloatingLoss = Math.min(maxFloatingLoss, (value / invested - 1) * 100);
+    }
+  }
+
+  const currentValue = shares * latest.unitNav;
+  const profit = currentValue - invested;
+  const profitRate = invested > 0 ? (profit / invested) * 100 : null;
+  const firstBuy = buys[0];
+  const lumpShares = firstBuy.unitNav ? invested / firstBuy.unitNav : 0;
+  const lumpValue = lumpShares * latest.unitNav;
+  const lumpProfitRate = invested > 0 ? (lumpValue / invested - 1) * 100 : null;
+
+  return {
+    monthlyAmount,
+    months: buys.length,
+    startDate: firstBuy.tradeDate,
+    endDate: latest.tradeDate,
+    invested,
+    shares,
+    currentValue,
+    profit,
+    profitRate,
+    maxFloatingLoss,
+    lumpValue,
+    lumpProfitRate
   };
 }
 
@@ -237,6 +498,7 @@ async function withDatabaseRetry<T>(fn: () => Promise<T>, attempts = 8): Promise
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
+      await ensureSqlitePragmas();
       return await fn();
     } catch (error) {
       lastError = error;
@@ -355,6 +617,7 @@ export async function getRecentSyncJobs(limit = 30) {
 export async function getDataCoverage() {
   const [
     fundTotalRows,
+    fundTypeRows,
     fundNavFundsRows,
     fundNavLatestRows,
     fundHistory14Rows,
@@ -376,6 +639,11 @@ export async function getDataCoverage() {
     wealthLatestRows
   ] = await withDatabaseRetry(() => Promise.all([
     prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(*) AS value FROM Fund`,
+    prisma.$queryRaw<Array<{ value: number }>>`
+      SELECT COUNT(*) AS value
+      FROM Fund
+      WHERE fundType IS NOT NULL AND fundType <> '' AND fundType <> '??' AND fundType <> '未知'
+    `,
     prisma.$queryRaw<Array<{ value: number }>>`SELECT COUNT(DISTINCT fundCode) AS value FROM FundNavDaily`,
     prisma.$queryRaw<Array<{ latestDate: string | null; value: number }>>`
       SELECT MAX(tradeDate) AS latestDate, COUNT(*) AS value
@@ -457,6 +725,13 @@ export async function getDataCoverage() {
       total: fundTotal,
       latestDate: fundNavLatestRows[0]?.latestDate,
       note: "每日涨跌、单位净值、累计净值"
+    }),
+    coverageMetric({
+      key: "fund_type",
+      label: "基金类型",
+      value: toCount(fundTypeRows[0]?.value),
+      total: fundTotal,
+      note: "用于候选池、同类排名、货币/ETF/QDII 专项展示"
     }),
     coverageMetric({
       key: "fund_history_14",
@@ -574,8 +849,8 @@ export async function getDataCoverage() {
   ];
 
   const recommendations = [
-    "白天边看页面边补数，建议运行 python scripts/collector/run_backfill.py --profile-limit 200 --history-limit 200。",
-    "夜间或不用页面时再运行 python scripts/collector/run_backfill.py --full；该任务会按缺失优先级续跑，但全量基金画像预计耗时很长。",
+    "白天边看页面边补数，建议运行 python scripts/collector/run_backfill.py --profile-limit 200 --history-limit 200 --history-days 756。",
+    "历史净值补采会优先处理持仓、关注和榜单基金；夜间或不用页面时再运行 python scripts/collector/run_backfill.py --full。",
     "银行理财公开源只能抓到可见样本；若要全市场，需要接入普益标准、Wind、Choice、iFinD 或用 WEALTH_PRODUCTS_JSON 导入授权数据。"
   ];
 
@@ -648,6 +923,7 @@ export async function getFundList(params: {
   type?: string | null;
   direction?: string | null;
   purchaseStatus?: string | null;
+  view?: string | null;
   returnRange?: string | null;
   minReturn?: string | number | null;
   maxDrawdown?: string | number | null;
@@ -661,7 +937,13 @@ export async function getFundList(params: {
   const pageSize = clampPageSize(params.pageSize);
   const offset = (page - 1) * pageSize;
   const filters: Prisma.Sql[] = [];
-  const returnRange = normalizeReturnRange(params.returnRange);
+  const view = params.view ?? "all";
+  const returnRange =
+    view === "strong_week"
+      ? "week_1"
+      : view === "strong_quarter"
+        ? "month_3"
+        : normalizeReturnRange(params.returnRange);
 
   if (params.q) {
     const pattern = `%${params.q.trim()}%`;
@@ -669,12 +951,30 @@ export async function getFundList(params: {
   }
 
   if (params.type) {
-    filters.push(Prisma.sql`f.fundType = ${params.type}`);
+    filters.push(fundTypeFilter(params.type));
   }
 
   if (params.purchaseStatus) {
     const pattern = `%${params.purchaseStatus.trim()}%`;
     filters.push(Prisma.sql`f.purchaseStatus LIKE ${pattern}`);
+  }
+
+  if (view === "watchlist") {
+    filters.push(Prisma.sql`w.id IS NOT NULL`);
+  } else if (view === "strong_week" || view === "strong_quarter") {
+    filters.push(Prisma.sql`selectedRank.rankValue > 0`);
+  } else if (view === "open_purchase") {
+    filters.push(Prisma.sql`f.purchaseStatus LIKE '%开放%' AND f.purchaseStatus NOT LIKE '%暂停%'`);
+  } else if (view === "data_ready") {
+    filters.push(Prisma.sql`
+      EXISTS (SELECT 1 FROM FundProfile fpReady WHERE fpReady.fundCode = f.code)
+      AND EXISTS (SELECT 1 FROM FundFee feeReady WHERE feeReady.fundCode = f.code)
+      AND (
+        SELECT COUNT(*)
+        FROM FundNavDaily navReady
+        WHERE navReady.fundCode = f.code AND navReady.unitNav IS NOT NULL
+      ) >= 240
+    `);
   }
 
   if (params.direction === "up") {
@@ -689,7 +989,7 @@ export async function getFundList(params: {
   const maxRate = optionalNumber(params.maxRate);
   const minReturn = optionalNumber(params.minReturn);
   const maxDrawdown = optionalNumber(params.maxDrawdown);
-  const usesRiskSql = Number.isFinite(maxDrawdown) || params.sort === "drawdown_desc";
+  const usesRiskSql = Number.isFinite(maxDrawdown) || params.sort === "drawdown_desc" || view === "low_drawdown";
 
   if (Number.isFinite(minRate)) {
     filters.push(Prisma.sql`latest.dailyGrowthRate >= ${minRate}`);
@@ -705,6 +1005,10 @@ export async function getFundList(params: {
 
   if (Number.isFinite(maxDrawdown)) {
     filters.push(Prisma.sql`risk.maxDrawdown >= ${maxDrawdown}`);
+  }
+
+  if (view === "low_drawdown") {
+    filters.push(Prisma.sql`risk.maxDrawdown >= -10 AND selectedRank.rankValue > 0`);
   }
 
   const whereSql = filters.length
@@ -784,6 +1088,16 @@ export async function getFundList(params: {
       selectedRank.rankValue AS selectedReturn,
       ${riskSelectSql} AS maxDrawdown,
       NULL AS volatility,
+      navStat.navSampleCount,
+      CASE
+        WHEN navStat.navSampleCount >= 720 AND fp.fundCode IS NOT NULL AND fee.fundCode IS NOT NULL THEN 100
+        WHEN navStat.navSampleCount >= 240 AND fp.fundCode IS NOT NULL AND fee.fundCode IS NOT NULL THEN 80
+        WHEN navStat.navSampleCount >= 60 THEN 55
+        WHEN navStat.navSampleCount >= 14 THEN 35
+        ELSE 15
+      END AS dataCompleteness,
+      CASE WHEN fp.fundCode IS NULL THEN 0 ELSE 1 END AS hasProfile,
+      CASE WHEN fee.fundCode IS NULL THEN 0 ELSE 1 END AS hasFee,
       CASE WHEN w.id IS NULL THEN 0 ELSE 1 END AS watched
     FROM Fund f
     LEFT JOIN FundNavDaily latest
@@ -801,6 +1115,17 @@ export async function getFundList(params: {
         LIMIT 1
       )
     ${riskJoinSql}
+    LEFT JOIN FundProfile fp ON fp.fundCode = f.code
+    LEFT JOIN (
+      SELECT fundCode, COUNT(*) AS navSampleCount
+      FROM FundNavDaily
+      WHERE unitNav IS NOT NULL
+      GROUP BY fundCode
+    ) navStat ON navStat.fundCode = f.code
+    LEFT JOIN (
+      SELECT DISTINCT fundCode
+      FROM FundFee
+    ) fee ON fee.fundCode = f.code
     LEFT JOIN Watchlist w
       ON w.targetType = 'fund' AND w.fundCode = f.code
     ${whereSql}
@@ -809,10 +1134,42 @@ export async function getFundList(params: {
     OFFSET ${offset}
   `;
 
-  const items = rows.map((row) => ({
-    ...row,
-    watched: Boolean(Number(row.watched))
-  }));
+  const items = rows.map((row) => {
+    const classification = classifyFund({
+      code: row.code,
+      name: row.name,
+      fundType: row.fundType
+    });
+    const navSampleCount = Number(row.navSampleCount ?? 0);
+    const hasProfile = Boolean(Number(row.hasProfile ?? 0));
+    const hasFee = Boolean(Number(row.hasFee ?? 0));
+    const coverage = buildFundDataCoverage({
+      navSampleCount,
+      latestNavDate: row.tradeDate,
+      periodReturnCount: row.selectedReturn === null || row.selectedReturn === undefined ? 0 : 1,
+      hasProfile,
+      hasFee,
+      hasRating: false,
+      stockHoldingCount: 0,
+      bondHoldingCount: 0,
+      industryCount: 0,
+      announcementCount: 0,
+      assetMode: classification.assetMode
+    });
+    return {
+      ...row,
+      fundType: classification.displayType,
+      fundTypeSource: classification.source,
+      assetMode: classification.assetMode,
+      navSampleCount,
+      dataCompleteness: coverage.score,
+      dataQualityLabel: coverage.label,
+      missingActions: coverage.missingActions,
+      hasProfile,
+      hasFee,
+      watched: Boolean(Number(row.watched))
+    };
+  });
 
   const totalRows = await prisma.$queryRaw<Array<{ total: number }>>`
     ${riskWithSql}
@@ -833,6 +1190,8 @@ export async function getFundList(params: {
         LIMIT 1
       )
     ${riskJoinSql}
+    LEFT JOIN Watchlist w
+      ON w.targetType = 'fund' AND w.fundCode = f.code
     ${whereSql}
   `;
 
@@ -847,7 +1206,477 @@ export async function getFundList(params: {
   };
 }
 
+function isOpenPurchaseStatus(status: string | null | undefined) {
+  if (!status) {
+    return false;
+  }
+  const text = status.replace(/\s/g, "");
+  return /(开放|申购|寮€鏀?|鐢宠喘)/.test(text) && !/(暂停|封闭|停止|不可|限制|鏆傚仠|灏侀棴|鍋滄|涓嶅彲|闄愬埗)/.test(text);
+}
+
+function positiveScore(value: number | null | undefined, weight: number) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return 0;
+  }
+  if (value <= 0) {
+    return 0;
+  }
+  return Math.min(weight, value * 1.2);
+}
+
+function buildCandidateReasons(input: {
+  dataScore: number;
+  openPurchase: boolean;
+  month3Return: number | null;
+  month6Return: number | null;
+  year1Return: number | null;
+  peerPercentile: number | null;
+  maxDrawdown: number | null;
+}) {
+  const reasons: string[] = [];
+  if (input.dataScore >= 70) reasons.push("数据较完整");
+  if (input.openPurchase) reasons.push("当前可申购");
+  if ((input.month3Return ?? 0) > 0 && (input.month6Return ?? 0) > 0) reasons.push("近 3 月和近 6 月收益为正");
+  if ((input.year1Return ?? 0) > 0) reasons.push("近 1 年收益为正");
+  if ((input.peerPercentile ?? 0) >= 70) reasons.push("近 1 年同类百分位靠前");
+  if (input.maxDrawdown !== null && input.maxDrawdown >= -10) reasons.push("样本回撤相对可控");
+  return reasons;
+}
+
+function buildCandidateRisks(input: {
+  dataScore: number;
+  openPurchase: boolean;
+  maxDrawdown: number | null;
+  volatility: number | null;
+  hasProfile: boolean;
+  hasFee: boolean;
+  highImpactAnnouncementCount: number;
+  assetMode: string | null;
+}) {
+  const risks: string[] = [];
+  if (!input.openPurchase) risks.push("申购状态需确认");
+  if (input.dataScore < 55) risks.push("数据可信度偏低");
+  if (!input.hasProfile) risks.push("缺少基金画像");
+  if (!input.hasFee) risks.push("缺少费率信息");
+  if (input.maxDrawdown !== null && input.maxDrawdown <= -20) risks.push("样本最大回撤较深");
+  if (input.volatility !== null && input.volatility >= 35) risks.push("波动率较高");
+  if (input.highImpactAnnouncementCount > 0) risks.push("近期存在高影响公告");
+  if (input.assetMode === "qdii") risks.push("QDII 净值可能滞后");
+  if (input.assetMode === "unknown") risks.push("基金类型仍需确认");
+  return risks;
+}
+
+async function attachCandidateRiskMetrics<T extends FundCandidateItem>(items: T[]) {
+  const codes = items.map((item) => item.code);
+  if (!codes.length) {
+    return items;
+  }
+
+  const navRows = await prisma.$queryRaw<
+    Array<{
+      fundCode: string;
+      tradeDate: Date | string;
+      unitNav: number | null;
+      dailyGrowthRate: number | null;
+    }>
+  >`
+    SELECT fundCode, tradeDate, unitNav, dailyGrowthRate
+    FROM (
+      SELECT
+        fundCode,
+        tradeDate,
+        unitNav,
+        dailyGrowthRate,
+        ROW_NUMBER() OVER (PARTITION BY fundCode ORDER BY tradeDate DESC) AS rn
+      FROM FundNavDaily
+      WHERE fundCode IN (${Prisma.join(codes)})
+        AND unitNav IS NOT NULL
+    )
+    WHERE rn <= 380
+    ORDER BY fundCode ASC, tradeDate DESC
+  `;
+
+  const navsByCode = new Map<string, typeof navRows>();
+  for (const nav of navRows) {
+    const bucket = navsByCode.get(nav.fundCode) ?? [];
+    if (bucket.length < 380) {
+      bucket.push(nav);
+      navsByCode.set(nav.fundCode, bucket);
+    }
+  }
+
+  return items.map((item) => {
+    const navs = [...(navsByCode.get(item.code) ?? [])].reverse();
+    const riskMetrics = calculateRiskMetrics(navs);
+    const openPurchase = isOpenPurchaseStatus(item.purchaseStatus);
+    const drawdownScore =
+      riskMetrics.maxDrawdown === null
+        ? 0
+        : riskMetrics.maxDrawdown >= -8
+          ? 15
+          : riskMetrics.maxDrawdown >= -15
+            ? 10
+            : riskMetrics.maxDrawdown >= -25
+              ? 4
+              : 0;
+    const returnScore =
+      positiveScore(item.weekReturn, 5) +
+      positiveScore(item.month3Return, 12) +
+      positiveScore(item.month6Return, 12) +
+      positiveScore(item.year1Return, 12);
+    const peerScore = item.peerPercentile === null ? 0 : Math.max(0, Math.min(15, (item.peerPercentile - 50) * 0.6));
+    const penalty =
+      (openPurchase ? 0 : 14) +
+      (item.highImpactAnnouncementCount > 0 ? 16 : 0) +
+      (item.assetMode === "money" ? 20 : 0) +
+      (item.assetMode === "unknown" ? 6 : 0);
+    const observationScore = Math.max(
+      0,
+      Math.min(100, Math.round(item.dataScore * 0.35 + returnScore + peerScore + drawdownScore + (openPurchase ? 10 : 0) - penalty))
+    );
+    const reasons = buildCandidateReasons({
+      dataScore: item.dataScore,
+      openPurchase,
+      month3Return: item.month3Return,
+      month6Return: item.month6Return,
+      year1Return: item.year1Return,
+      peerPercentile: item.peerPercentile,
+      maxDrawdown: riskMetrics.maxDrawdown
+    });
+    const risks = buildCandidateRisks({
+      dataScore: item.dataScore,
+      openPurchase,
+      maxDrawdown: riskMetrics.maxDrawdown,
+      volatility: riskMetrics.volatility,
+      hasProfile: item.hasProfile,
+      hasFee: item.hasFee,
+      highImpactAnnouncementCount: item.highImpactAnnouncementCount,
+      assetMode: item.assetMode
+    });
+
+    return {
+      ...item,
+      maxDrawdown: riskMetrics.maxDrawdown,
+      volatility: riskMetrics.volatility,
+      observationScore,
+      reasons: reasons.length ? reasons : ["进入基础观察池"],
+      risks
+    };
+  });
+}
+
+export async function getFundCandidatePool(params: {
+  type?: string | null;
+  grade?: string | null;
+  sort?: string | null;
+  page?: string | number | null;
+  pageSize?: string | number | null;
+}): Promise<PagedResult<FundCandidateItem> & { summary: FundCandidateSummary }> {
+  const page = toPositiveInt(params.page, 1);
+  const pageSize = clampPageSize(params.pageSize);
+  const filters: Prisma.Sql[] = [
+    Prisma.sql`navStat.navSampleCount >= 60`,
+    Prisma.sql`(rp.month3Return IS NOT NULL OR rp.month6Return IS NOT NULL OR rp.year1Return IS NOT NULL)`
+  ];
+  if (params.type) {
+    filters.push(fundTypeFilter(params.type));
+  }
+  const whereSql = Prisma.sql`WHERE ${Prisma.join(filters, " AND ")}`;
+
+  const rows = await withDatabaseRetry(() => prisma.$queryRaw<
+    Array<{
+      code: string;
+      name: string;
+      fundType: string | null;
+      purchaseStatus: string | null;
+      tradeDate: Date | string | null;
+      unitNav: number | null;
+      dailyGrowthRate: number | null;
+      weekReturn: number | null;
+      month3Return: number | null;
+      month6Return: number | null;
+      year1Return: number | null;
+      peerTotal: number | null;
+      peerRank: number | null;
+      navSampleCount: number | null;
+      hasProfile: number | null;
+      hasFee: number | null;
+      highImpactAnnouncementCount: number | null;
+      watched: number | null;
+    }>
+  >`
+    WITH latest_rank_date AS (
+      SELECT rangeKey, MAX(rankDate) AS rankDate
+      FROM FundRankDaily
+      WHERE rangeKey IN ('week_1', 'month_3', 'month_6', 'year_1')
+      GROUP BY rangeKey
+    ),
+    rank_pivot AS (
+      SELECT
+        r.fundCode,
+        MAX(CASE WHEN r.rangeKey = 'week_1' THEN r.rankValue END) AS weekReturn,
+        MAX(CASE WHEN r.rangeKey = 'month_3' THEN r.rankValue END) AS month3Return,
+        MAX(CASE WHEN r.rangeKey = 'month_6' THEN r.rankValue END) AS month6Return,
+        MAX(CASE WHEN r.rangeKey = 'year_1' THEN r.rankValue END) AS year1Return
+      FROM FundRankDaily r
+      JOIN latest_rank_date latestDate
+        ON latestDate.rangeKey = r.rangeKey AND latestDate.rankDate = r.rankDate
+      WHERE r.rangeKey IN ('week_1', 'month_3', 'month_6', 'year_1')
+      GROUP BY r.fundCode
+    ),
+    navStat AS (
+      SELECT fundCode, COUNT(*) AS navSampleCount, MAX(tradeDate) AS latestTradeDate
+      FROM FundNavDaily
+      WHERE unitNav IS NOT NULL
+      GROUP BY fundCode
+    ),
+    year_peer AS (
+      SELECT
+        rp.fundCode,
+        COUNT(*) OVER (PARTITION BY f.fundType) AS peerTotal,
+        RANK() OVER (PARTITION BY f.fundType ORDER BY rp.year1Return DESC) AS peerRank
+      FROM rank_pivot rp
+      JOIN Fund f ON f.code = rp.fundCode
+      WHERE rp.year1Return IS NOT NULL
+    )
+    SELECT
+      f.code,
+      f.name,
+      f.fundType,
+      f.purchaseStatus,
+      latest.tradeDate,
+      latest.unitNav,
+      latest.dailyGrowthRate,
+      rp.weekReturn,
+      rp.month3Return,
+      rp.month6Return,
+      rp.year1Return,
+      peer.peerTotal,
+      peer.peerRank,
+      navStat.navSampleCount,
+      CASE WHEN fp.fundCode IS NULL THEN 0 ELSE 1 END AS hasProfile,
+      CASE WHEN fee.fundCode IS NULL THEN 0 ELSE 1 END AS hasFee,
+      COALESCE(ann.highImpactAnnouncementCount, 0) AS highImpactAnnouncementCount,
+      CASE WHEN w.id IS NULL THEN 0 ELSE 1 END AS watched
+    FROM Fund f
+    JOIN rank_pivot rp ON rp.fundCode = f.code
+    JOIN navStat ON navStat.fundCode = f.code
+    LEFT JOIN FundNavDaily latest
+      ON latest.fundCode = f.code AND latest.tradeDate = navStat.latestTradeDate
+    LEFT JOIN year_peer peer ON peer.fundCode = f.code
+    LEFT JOIN FundProfile fp ON fp.fundCode = f.code
+    LEFT JOIN (SELECT DISTINCT fundCode FROM FundFee) fee ON fee.fundCode = f.code
+    LEFT JOIN (
+      SELECT fundCode, COUNT(*) AS highImpactAnnouncementCount
+      FROM Announcement
+      WHERE targetType = 'fund'
+        AND (source LIKE '%personnel%' OR title LIKE '%经理%' OR title LIKE '%暂停%' OR title LIKE '%清盘%' OR title LIKE '%终止%' OR title LIKE '%费率%')
+      GROUP BY fundCode
+    ) ann ON ann.fundCode = f.code
+    LEFT JOIN Watchlist w ON w.targetType = 'fund' AND w.fundCode = f.code
+    ${whereSql}
+    ORDER BY
+      rp.year1Return DESC NULLS LAST,
+      rp.month6Return DESC NULLS LAST,
+      rp.month3Return DESC NULLS LAST,
+      f.code ASC
+    LIMIT 800
+  `);
+
+  const baseItems: FundCandidateItem[] = rows.map((row) => {
+    const classification = classifyFund({
+      code: row.code,
+      name: row.name,
+      fundType: row.fundType
+    });
+    const navSampleCount = Number(row.navSampleCount ?? 0);
+    const hasProfile = Boolean(Number(row.hasProfile ?? 0));
+    const hasFee = Boolean(Number(row.hasFee ?? 0));
+    const periodReturnCount = [row.weekReturn, row.month3Return, row.month6Return, row.year1Return].filter(
+      (value) => value !== null && value !== undefined
+    ).length;
+    const coverage = buildFundDataCoverage({
+      navSampleCount,
+      latestNavDate: row.tradeDate,
+      periodReturnCount,
+      hasProfile,
+      hasFee,
+      hasRating: false,
+      stockHoldingCount: 0,
+      bondHoldingCount: 0,
+      industryCount: 0,
+      announcementCount: Number(row.highImpactAnnouncementCount ?? 0),
+      assetMode: classification.assetMode
+    });
+    const peerTotal = Number(row.peerTotal ?? 0);
+    const peerRank = Number(row.peerRank ?? 0);
+    const peerPercentile = peerTotal > 0 && peerRank > 0 ? ((peerTotal - peerRank + 1) / peerTotal) * 100 : null;
+    return {
+      code: row.code,
+      name: row.name,
+      fundType: classification.displayType,
+      assetMode: classification.assetMode,
+      tradeDate: row.tradeDate,
+      unitNav: row.unitNav,
+      dailyGrowthRate: row.dailyGrowthRate,
+      weekReturn: row.weekReturn,
+      month3Return: row.month3Return,
+      month6Return: row.month6Return,
+      year1Return: row.year1Return,
+      peerPercentile,
+      maxDrawdown: null,
+      volatility: null,
+      dataScore: coverage.score,
+      observationScore: 0,
+      navSampleCount,
+      hasProfile,
+      hasFee,
+      highImpactAnnouncementCount: Number(row.highImpactAnnouncementCount ?? 0),
+      purchaseStatus: row.purchaseStatus,
+      watched: Boolean(Number(row.watched ?? 0)),
+      reasons: [],
+      risks: []
+    };
+  });
+
+  const withRisk = await attachCandidateRiskMetrics(baseItems);
+  const grade = params.grade ?? "all";
+  const filtered = withRisk.filter((item) => {
+    if (grade === "strong") return item.observationScore >= 75;
+    if (grade === "watchable") return item.observationScore >= 60 && item.observationScore < 75;
+    if (grade === "cautious") return item.observationScore < 60;
+    return true;
+  });
+
+  const sorted = [...filtered].sort((a, b) => {
+    if (params.sort === "drawdown") {
+      return (b.maxDrawdown ?? -999) - (a.maxDrawdown ?? -999) || b.observationScore - a.observationScore;
+    }
+    if (params.sort === "year") {
+      return (b.year1Return ?? -999) - (a.year1Return ?? -999) || b.observationScore - a.observationScore;
+    }
+    if (params.sort === "data") {
+      return b.dataScore - a.dataScore || b.observationScore - a.observationScore;
+    }
+    return b.observationScore - a.observationScore || (b.year1Return ?? -999) - (a.year1Return ?? -999);
+  });
+
+  const total = sorted.length;
+  const start = (page - 1) * pageSize;
+  const items = sorted.slice(start, start + pageSize);
+  const summary: FundCandidateSummary = {
+    totalScanned: withRisk.length,
+    strongCount: withRisk.filter((item) => item.observationScore >= 75).length,
+    watchableCount: withRisk.filter((item) => item.observationScore >= 60 && item.observationScore < 75).length,
+    cautiousCount: withRisk.filter((item) => item.observationScore < 60).length,
+    generatedAt: new Date().toISOString()
+  };
+
+  return {
+    items,
+    total,
+    page,
+    pageSize,
+    pageCount: Math.max(1, Math.ceil(total / pageSize)),
+    summary
+  };
+}
+
+async function getPeerPercentiles(input: {
+  fundCode: string;
+  fundType: string | null;
+  periodReturns: Array<{ rangeKey: string; rankValue: number | null; rankDate: Date | string | null }>;
+}) {
+  const result = new Map<string, { peerRank: number | null; peerTotal: number; peerPercentile: number | null }>();
+  await Promise.all(
+    input.periodReturns.map(async (period) => {
+      if (period.rankValue === null || period.rankValue === undefined || !period.rankDate) {
+        result.set(period.rangeKey, { peerRank: null, peerTotal: 0, peerPercentile: null });
+        return;
+      }
+      const typeFilter = input.fundType
+        ? Prisma.sql`AND ${fundTypeFilter(input.fundType)}`
+        : Prisma.empty;
+      const rows = await prisma.$queryRaw<Array<{ total: number; better: number }>>`
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN r.rankValue > ${period.rankValue} THEN 1 ELSE 0 END) AS better
+        FROM FundRankDaily r
+        JOIN Fund f ON f.code = r.fundCode
+        WHERE r.rangeKey = ${period.rangeKey}
+          AND r.rankDate = ${period.rankDate}
+          AND r.rankValue IS NOT NULL
+          ${typeFilter}
+      `;
+      const total = Number(rows[0]?.total ?? 0);
+      const better = Number(rows[0]?.better ?? 0);
+      const peerRank = total > 0 ? better + 1 : null;
+      const peerPercentile = total > 0 ? ((total - better) / total) * 100 : null;
+      result.set(period.rangeKey, { peerRank, peerTotal: total, peerPercentile });
+    })
+  );
+  return result;
+}
+
+async function getShareClassComparison(fundCode: string, fundName: string) {
+  const baseName = normalizeFundBaseName(fundName);
+  if (!baseName || baseName.length < 3) {
+    return { baseName: fundName, items: [], breakEven: null };
+  }
+
+  const candidates = await prisma.fund.findMany({
+    where: {
+      OR: [{ code: fundCode }, { name: { startsWith: baseName } }]
+    },
+    include: {
+      fees: {
+        orderBy: [{ feeType: "asc" }, { id: "asc" }],
+        take: 30
+      },
+      navs: {
+        orderBy: { tradeDate: "desc" },
+        take: 1
+      },
+      ranks: {
+        where: { rangeKey: "year_1" },
+        orderBy: [{ rankDate: "desc" }, { createdAt: "desc" }],
+        take: 1
+      }
+    },
+    take: 20
+  });
+
+  const items = candidates
+    .filter((item) => normalizeFundBaseName(item.name) === baseName)
+    .map((item) => {
+      const feeSummary = summarizeFeeRows(item.fees);
+      return {
+        code: item.code,
+        name: item.name,
+        shareClass: inferShareClass(item.name),
+        isCurrent: item.code === fundCode,
+        purchaseStatus: item.purchaseStatus,
+        redeemStatus: item.redeemStatus,
+        latestNav: item.navs[0]?.unitNav ?? null,
+        latestNavDate: item.navs[0]?.tradeDate ?? null,
+        yearReturn: item.ranks[0]?.rankValue ?? null,
+        feeSummary,
+        cost30d: estimateClassCost(feeSummary, 30),
+        cost365d: estimateClassCost(feeSummary, 365)
+      };
+    })
+    .sort((a, b) => {
+      if (a.shareClass === b.shareClass) {
+        return a.code.localeCompare(b.code);
+      }
+      return a.shareClass.localeCompare(b.shareClass);
+    });
+
+  return { baseName, items, breakEven: buildShareClassBreakEven(items) };
+}
+
 export async function getFundDetail(code: string) {
+  await ensureSqlitePragmas();
   const fund = await prisma.fund.findUnique({
     where: { code },
     include: {
@@ -897,7 +1726,7 @@ export async function getFundDetail(code: string) {
       latestReturnByRange.set(row.rangeKey, row);
     }
   }
-  const periodReturns = FUND_DETAIL_RETURN_RANGES.map((range) => {
+  const basePeriodReturns = FUND_DETAIL_RETURN_RANGES.map((range) => {
     const row = latestReturnByRange.get(range.key);
     return {
       rangeKey: range.key,
@@ -907,8 +1736,41 @@ export async function getFundDetail(code: string) {
     };
   });
   const orderedNavs = [...fund.navs].reverse();
+  const classification = classifyFund({
+    code: fund.code,
+    name: fund.name,
+    fundType: fund.fundType,
+    fundTypeDetail: fund.profile?.fundTypeDetail,
+    benchmark: fund.profile?.benchmark
+  });
+  const [peerPercentiles, shareClassComparison, holdingCounts, latestMoneyData, latestExchangeQuote] = await Promise.all([
+    getPeerPercentiles({ fundCode: fund.code, fundType: classification.normalizedType, periodReturns: basePeriodReturns }),
+    getShareClassComparison(fund.code, fund.name),
+    Promise.all([
+      prisma.fundHolding.count({ where: { fundCode: code } }),
+      prisma.fundBondHolding.count({ where: { fundCode: code } }),
+      prisma.fundIndustryAllocation.count({ where: { fundCode: code } })
+    ]).then(([stockHoldings, bondHoldings, industries]) => ({ stockHoldings, bondHoldings, industries })),
+    prisma.fundMoneyDaily.findFirst({
+      where: { fundCode: code },
+      orderBy: [{ tradeDate: "desc" }, { createdAt: "desc" }]
+    }),
+    prisma.fundExchangeQuote.findFirst({
+      where: { fundCode: code },
+      orderBy: [{ tradeDate: "desc" }, { createdAt: "desc" }]
+    })
+  ]);
+  const periodReturns = basePeriodReturns.map((period) => ({
+    ...period,
+    ...(peerPercentiles.get(period.rangeKey) ?? { peerRank: null, peerTotal: 0, peerPercentile: null })
+  }));
   const riskMetrics = calculateRiskMetrics(orderedNavs);
+  const investmentSimulation = buildInvestmentSimulation(orderedNavs);
   const latestNav = orderedNavs.at(-1);
+  const classifiedAnnouncements = fund.announcements.map((item) => ({
+    ...item,
+    impact: classifyAnnouncementImpact(item.title, item.source)
+  }));
   const warnings: AlertItem[] = [];
   if (latestNav?.dailyGrowthRate !== null && latestNav?.dailyGrowthRate !== undefined && latestNav.dailyGrowthRate <= -3) {
     warnings.push({
@@ -941,7 +1803,17 @@ export async function getFundDetail(code: string) {
       metric: "scale_low"
     });
   }
-  if (fund.announcements.some((item) => item.source.includes("personnel"))) {
+  const highImpactAnnouncement = classifiedAnnouncements.find((item) => item.impact.level === "high");
+  if (highImpactAnnouncement) {
+    warnings.push({
+      level: "high",
+      targetType: "fund",
+      targetKey: fund.code,
+      title: "近期有高影响公告",
+      message: `${highImpactAnnouncement.title}。`,
+      metric: "high_impact_announcement"
+    });
+  } else if (classifiedAnnouncements.some((item) => item.source.includes("personnel"))) {
     warnings.push({
       level: "low",
       targetType: "fund",
@@ -951,12 +1823,37 @@ export async function getFundDetail(code: string) {
       metric: "personnel_announcement"
     });
   }
+  const dataCoverage = buildFundDataCoverage({
+    navSampleCount: orderedNavs.length,
+    latestNavDate: latestNav?.tradeDate ?? null,
+    periodReturnCount: periodReturns.filter((item) => item.rankValue !== null && item.rankValue !== undefined).length,
+    hasProfile: Boolean(fund.profile),
+    hasFee: fund.fees.length > 0,
+    hasRating: fund.ratings.length > 0,
+    stockHoldingCount: holdingCounts.stockHoldings,
+    bondHoldingCount: holdingCounts.bondHoldings,
+    industryCount: holdingCounts.industries,
+    announcementCount: classifiedAnnouncements.length,
+    hasMoneyData: Boolean(latestMoneyData),
+    hasExchangeQuote: Boolean(latestExchangeQuote),
+    assetMode: classification.assetMode
+  });
 
   return {
     ...fund,
+    fundType: classification.displayType,
+    fundTypeSource: classification.source,
+    fundClassification: classification,
+    dataCoverage,
+    holdingCounts,
+    latestMoneyData,
+    latestExchangeQuote,
     navs: orderedNavs,
+    announcements: classifiedAnnouncements,
     periodReturns,
     riskMetrics,
+    investmentSimulation,
+    shareClassComparison,
     latestRating: fund.ratings[0] ?? null,
     warnings,
     watched: fund.watchlistEntries.length > 0
@@ -1288,6 +2185,7 @@ export async function getWealthProductList(params: {
   riskLevel?: string | null;
   operationMode?: string | null;
   direction?: string | null;
+  dataStatus?: string | null;
   sort?: string | null;
   page?: string | number | null;
   pageSize?: string | number | null;
@@ -1323,6 +2221,14 @@ export async function getWealthProductList(params: {
     filters.push(Prisma.sql`latest.dailyChangeRate = 0`);
   }
 
+  if (params.dataStatus === "with_change") {
+    filters.push(Prisma.sql`latest.netValue IS NOT NULL AND latest.dailyChangeRate IS NOT NULL`);
+  } else if (params.dataStatus === "net_value_only") {
+    filters.push(Prisma.sql`latest.netValue IS NOT NULL AND latest.dailyChangeRate IS NULL`);
+  } else if (params.dataStatus === "disclosure_only") {
+    filters.push(Prisma.sql`latest.netValue IS NULL`);
+  }
+
   const whereSql = filters.length
     ? Prisma.sql`WHERE ${Prisma.join(filters, " AND ")}`
     : Prisma.empty;
@@ -1350,6 +2256,11 @@ export async function getWealthProductList(params: {
       latest.accumulatedValue,
       latest.dailyChange,
       latest.dailyChangeRate,
+      CASE
+        WHEN latest.netValue IS NOT NULL AND latest.dailyChangeRate IS NOT NULL THEN 'with_change'
+        WHEN latest.netValue IS NOT NULL THEN 'net_value_only'
+        ELSE 'disclosure_only'
+      END AS navStatus,
       CASE WHEN w.id IS NULL THEN 0 ELSE 1 END AS watched
     FROM WealthProduct p
     LEFT JOIN WealthNavDaily latest
@@ -1531,72 +2442,416 @@ export async function toggleWatchlist(input: {
 }
 
 export async function getPortfolioDashboard() {
-  const holdings = await prisma.portfolioHolding.findMany({
-    orderBy: [{ targetType: "asc" }, { updatedAt: "desc" }],
-    include: {
-      fund: {
-        include: {
-          navs: { orderBy: { tradeDate: "desc" }, take: 2 }
-        }
-      },
-      product: {
-        include: {
-          navs: { orderBy: { navDate: "desc" }, take: 2 }
+  await ensureSqlitePragmas();
+  const [holdings, targetRows] = await Promise.all([
+    prisma.portfolioHolding.findMany({
+      orderBy: [{ targetType: "asc" }, { updatedAt: "desc" }],
+      include: {
+        fund: {
+          include: {
+            navs: { orderBy: { tradeDate: "desc" }, take: 2 },
+            fees: { orderBy: [{ feeType: "asc" }, { id: "asc" }], take: 20 }
+          }
+        },
+        product: {
+          include: {
+            navs: { orderBy: { navDate: "desc" }, take: 2 }
+          }
+        },
+        transactions: {
+          orderBy: [{ tradeDate: "desc" }, { id: "desc" }]
         }
       }
-    }
-  });
+    }),
+    prisma.portfolioTarget.findMany()
+  ]);
 
-  const items = holdings.map((holding) => {
+  function aggregateTransactions(
+    transactions: Array<{
+      transactionType: string;
+      shares: number | null;
+      price: number | null;
+      amount: number | null;
+      fee: number | null;
+      tradeDate: Date;
+    }>
+  ) {
+    const ordered = [...transactions].sort((a, b) => {
+      const dateDiff = a.tradeDate.getTime() - b.tradeDate.getTime();
+      return dateDiff === 0 ? 0 : dateDiff;
+    });
+    let shares = 0;
+    let costBasis = 0;
+    let totalInvested = 0;
+    let realizedIncome = 0;
+    let realizedProfit = 0;
+    let dividendIncome = 0;
+    let feeAmount = 0;
+    for (const item of ordered) {
+      const fee = item.fee ?? 0;
+      const units = item.shares ?? (item.amount && item.price ? item.amount / item.price : 0);
+      const amount = item.amount ?? (item.shares && item.price ? item.shares * item.price : 0);
+      if (item.transactionType === "buy") {
+        shares += units;
+        costBasis += amount + fee;
+        totalInvested += amount + fee;
+        feeAmount += fee;
+      } else if (item.transactionType === "sell") {
+        const sellShares = Math.min(shares, units);
+        const averageCost = shares > 0 ? costBasis / shares : 0;
+        const removedCost = sellShares * averageCost;
+        const proceeds = Math.max(0, amount - fee);
+        shares = Math.max(0, shares - sellShares);
+        costBasis = Math.max(0, costBasis - removedCost);
+        realizedIncome += proceeds;
+        realizedProfit += proceeds - removedCost;
+        feeAmount += fee;
+      } else if (item.transactionType === "dividend") {
+        realizedIncome += amount;
+        realizedProfit += amount;
+        dividendIncome += amount;
+      } else if (item.transactionType === "fee") {
+        costBasis += amount;
+        totalInvested += amount;
+        feeAmount += amount;
+      }
+    }
+
+    return {
+      hasTransactions: transactions.length > 0,
+      shares: shares > 0 ? shares : null,
+      costAmount: costBasis,
+      totalInvested,
+      realizedIncome,
+      realizedProfit,
+      dividendIncome,
+      feeAmount,
+      transactionCount: transactions.length,
+      latestTransactionDate: transactions[0]?.tradeDate ?? null
+    };
+  }
+
+  const baseItems = holdings.map((holding) => {
     const latestFundNav = holding.fund?.navs[0];
     const previousFundNav = holding.fund?.navs[1];
     const latestWealthNav = holding.product?.navs[0];
     const previousWealthNav = holding.product?.navs[1];
     const latestPrice = latestFundNav?.unitNav ?? latestWealthNav?.netValue ?? null;
     const previousPrice = previousFundNav?.unitNav ?? previousWealthNav?.netValue ?? null;
+    const transactionSummary = aggregateTransactions(holding.transactions);
     const shares =
+      transactionSummary.shares ??
       holding.shares ??
       (holding.costAmount && holding.costPrice && holding.costPrice > 0 ? holding.costAmount / holding.costPrice : null);
-    const currentValue = shares && latestPrice ? shares * latestPrice : holding.costAmount;
-    const profit = currentValue !== null && holding.costAmount !== null ? currentValue - holding.costAmount : null;
-    const profitRate = profit !== null && holding.costAmount && holding.costAmount > 0 ? (profit / holding.costAmount) * 100 : null;
+    const costAmount = transactionSummary.hasTransactions ? transactionSummary.costAmount : holding.costAmount;
+    const currentValue = shares && latestPrice ? shares * latestPrice : costAmount;
+    const unrealizedProfit = currentValue !== null && costAmount !== null ? currentValue - costAmount : null;
+    const profit =
+      unrealizedProfit !== null
+        ? unrealizedProfit + (transactionSummary.hasTransactions ? transactionSummary.realizedProfit : 0)
+        : null;
+    const profitBase = transactionSummary.hasTransactions ? transactionSummary.totalInvested : costAmount;
+    const profitRate = profit !== null && profitBase && profitBase > 0 ? (profit / profitBase) * 100 : null;
     const dailyProfit = shares && latestPrice && previousPrice ? shares * (latestPrice - previousPrice) : null;
     const dailyRate =
       latestFundNav?.dailyGrowthRate ??
       latestWealthNav?.dailyChangeRate ??
       (latestPrice && previousPrice ? (latestPrice / previousPrice - 1) * 100 : null);
+    const feeSummary = holding.fund ? summarizeFeeRows(holding.fund.fees) : null;
+    const holdingDays = daysBetween(holding.purchaseDate, latestFundNav?.tradeDate ?? latestWealthNav?.navDate ?? new Date());
+    const estimatedRedemptionFee =
+      holding.targetType === "fund" && costAmount && feeSummary?.redemptionRate !== null && feeSummary?.redemptionRate !== undefined
+        ? costAmount * (feeSummary.redemptionRate / 100)
+        : null;
     return {
       id: holding.id,
       targetType: holding.targetType,
       targetKey: holding.targetKey,
       name: holding.displayName ?? holding.fund?.name ?? holding.product?.name ?? holding.targetKey,
       issuer: holding.product?.issuer ?? holding.fund?.fundType ?? null,
+      fundType: holding.fund?.fundType ?? null,
       shares,
-      costAmount: holding.costAmount,
-      costPrice: holding.costPrice,
+      costAmount,
+      costPrice: shares && costAmount && shares > 0 ? costAmount / shares : holding.costPrice,
+      purchaseDate: holding.purchaseDate,
+      holdingDays,
       latestPrice,
       currentValue,
       profit,
+      unrealizedProfit,
+      realizedProfit: transactionSummary.hasTransactions ? transactionSummary.realizedProfit : 0,
       profitRate,
       dailyProfit,
       dailyRate,
+      estimatedRedemptionFee,
+      redemptionRate: feeSummary?.redemptionRate ?? null,
+      transactionCount: transactionSummary.transactionCount,
+      totalInvested: transactionSummary.totalInvested,
+      realizedIncome: transactionSummary.realizedIncome,
+      dividendIncome: transactionSummary.dividendIncome,
+      feeAmount: transactionSummary.feeAmount,
+      latestTransactionDate: transactionSummary.latestTransactionDate,
       priceDate: latestFundNav?.tradeDate ?? latestWealthNav?.navDate ?? null,
       note: holding.note
     };
   });
 
-  const summary = items.reduce(
+  const summary = baseItems.reduce(
     (acc, item) => {
       acc.costAmount += item.costAmount ?? 0;
       acc.currentValue += item.currentValue ?? 0;
       acc.profit += item.profit ?? 0;
+      acc.unrealizedProfit += item.unrealizedProfit ?? 0;
+      acc.realizedProfit += item.realizedProfit ?? 0;
       acc.dailyProfit += item.dailyProfit ?? 0;
+      acc.totalInvested += item.totalInvested ?? 0;
+      acc.realizedIncome += item.realizedIncome ?? 0;
+      acc.dividendIncome += item.dividendIncome ?? 0;
+      acc.feeAmount += item.feeAmount ?? 0;
+      acc.transactionCount += item.transactionCount ?? 0;
       return acc;
     },
-    { costAmount: 0, currentValue: 0, profit: 0, dailyProfit: 0 }
+    {
+      costAmount: 0,
+      currentValue: 0,
+      profit: 0,
+      unrealizedProfit: 0,
+      realizedProfit: 0,
+      dailyProfit: 0,
+      totalInvested: 0,
+      realizedIncome: 0,
+      dividendIncome: 0,
+      feeAmount: 0,
+      transactionCount: 0
+    }
   );
   const profitRate = summary.costAmount > 0 ? (summary.profit / summary.costAmount) * 100 : null;
-  return { items, summary: { ...summary, profitRate } };
+  const items = baseItems.map((item) => ({
+    ...item,
+    positionWeight: summary.currentValue > 0 && item.currentValue ? (item.currentValue / summary.currentValue) * 100 : null
+  }));
+  const itemsWithSellChecks = items.map((item) => {
+    const checks = [
+      {
+        label: "赎回费",
+        status: item.redemptionRate !== null && item.redemptionRate > 0 ? "warn" : item.targetType === "fund" ? "ok" : "missing",
+        detail:
+          item.redemptionRate !== null
+            ? `估算费率 ${item.redemptionRate.toFixed(2)}%，费用约 ${item.estimatedRedemptionFee?.toFixed(2) ?? "--"} 元`
+            : "缺少赎回费率"
+      },
+      {
+        label: "持有天数",
+        status: item.holdingDays === null ? "missing" : item.holdingDays < 30 ? "warn" : "ok",
+        detail: item.holdingDays === null ? "缺少买入日期" : `已持有约 ${item.holdingDays} 天`
+      },
+      {
+        label: "盈亏状态",
+        status: item.profitRate !== null && item.profitRate <= -10 ? "warn" : item.profitRate === null ? "missing" : "ok",
+        detail: item.profitRate === null ? "缺少成本或市值" : `当前累计收益率 ${item.profitRate.toFixed(2)}%`
+      },
+      {
+        label: "短期波动",
+        status: item.dailyRate !== null && item.dailyRate <= -3 ? "warn" : item.dailyRate === null ? "missing" : "ok",
+        detail: item.dailyRate === null ? "缺少相邻净值" : `最新日涨跌 ${item.dailyRate.toFixed(2)}%`
+      },
+      {
+        label: "仓位占比",
+        status: item.positionWeight !== null && item.positionWeight >= 30 ? "warn" : item.positionWeight === null ? "missing" : "ok",
+        detail: item.positionWeight === null ? "无法计算仓位" : `组合占比 ${item.positionWeight.toFixed(1)}%`
+      },
+      {
+        label: "流水完整度",
+        status: item.transactionCount > 0 ? "ok" : "missing",
+        detail: item.transactionCount > 0 ? `${item.transactionCount} 条交易流水` : "未录入真实交易流水"
+      }
+    ];
+    const warnCount = checks.filter((check) => check.status === "warn").length;
+    const missingCount = checks.filter((check) => check.status === "missing").length;
+    return {
+      ...item,
+      sellCheck: {
+        level: warnCount >= 2 ? "high" : warnCount === 1 || missingCount >= 2 ? "medium" : "low",
+        summary:
+          warnCount > 0
+            ? `赎回前需重点核对 ${warnCount} 项风险`
+            : missingCount > 0
+              ? `赎回前先补齐 ${missingCount} 项信息`
+              : "赎回前基础信息较完整",
+        checks
+      }
+    };
+  });
+
+  const fundCodes = itemsWithSellChecks.filter((item) => item.targetType === "fund").map((item) => item.targetKey);
+  const [stockRows, industryRows] = fundCodes.length
+    ? await Promise.all([
+        prisma.fundHolding.findMany({
+          where: { fundCode: { in: fundCodes }, ratio: { not: null } },
+          orderBy: [{ fundCode: "asc" }, { reportPeriod: "desc" }, { ratio: "desc" }],
+          take: fundCodes.length * 80
+        }),
+        prisma.fundIndustryAllocation.findMany({
+          where: { fundCode: { in: fundCodes }, ratio: { not: null } },
+          orderBy: [{ fundCode: "asc" }, { reportDate: "desc" }, { ratio: "desc" }],
+          take: fundCodes.length * 80
+        })
+      ])
+    : [[], []];
+
+  const fundWeights = new Map(
+    itemsWithSellChecks
+      .filter((item) => item.targetType === "fund" && item.positionWeight !== null)
+      .map((item) => [item.targetKey, Number(item.positionWeight) / 100])
+  );
+
+  const latestStockPeriod = new Map<string, string>();
+  for (const row of stockRows) {
+    if (!latestStockPeriod.has(row.fundCode)) {
+      latestStockPeriod.set(row.fundCode, row.reportPeriod);
+    }
+  }
+  const stockExposure = new Map<string, { stockCode: string; stockName: string; exposure: number; fundCount: number; funds: Set<string> }>();
+  for (const row of stockRows) {
+    if (latestStockPeriod.get(row.fundCode) !== row.reportPeriod || row.ratio === null) {
+      continue;
+    }
+    const fundWeight = fundWeights.get(row.fundCode) ?? 0;
+    const exposure = fundWeight * row.ratio;
+    const key = row.stockCode || row.stockName;
+    const item =
+      stockExposure.get(key) ??
+      { stockCode: row.stockCode, stockName: row.stockName, exposure: 0, fundCount: 0, funds: new Set<string>() };
+    item.exposure += exposure;
+    item.funds.add(row.fundCode);
+    item.fundCount = item.funds.size;
+    stockExposure.set(key, item);
+  }
+
+  const latestIndustryDate = new Map<string, string>();
+  for (const row of industryRows) {
+    const date = row.reportDate.toISOString();
+    if (!latestIndustryDate.has(row.fundCode)) {
+      latestIndustryDate.set(row.fundCode, date);
+    }
+  }
+  const industryExposure = new Map<string, { industryName: string; exposure: number; fundCount: number; funds: Set<string> }>();
+  for (const row of industryRows) {
+    const date = row.reportDate.toISOString();
+    if (latestIndustryDate.get(row.fundCode) !== date || row.ratio === null) {
+      continue;
+    }
+    const fundWeight = fundWeights.get(row.fundCode) ?? 0;
+    const exposure = fundWeight * row.ratio;
+    const item =
+      industryExposure.get(row.industryName) ??
+      { industryName: row.industryName, exposure: 0, fundCount: 0, funds: new Set<string>() };
+    item.exposure += exposure;
+    item.funds.add(row.fundCode);
+    item.fundCount = item.funds.size;
+    industryExposure.set(row.industryName, item);
+  }
+
+  const topPositions = [...itemsWithSellChecks]
+    .filter((item) => item.positionWeight !== null)
+    .sort((a, b) => Number(b.positionWeight) - Number(a.positionWeight))
+    .slice(0, 5);
+  const topStocks = [...stockExposure.values()]
+    .map((item) => ({ ...item, funds: undefined }))
+    .sort((a, b) => b.exposure - a.exposure)
+    .slice(0, 8);
+  const overlappingStocks = [...stockExposure.values()]
+    .filter((item) => item.fundCount >= 2)
+    .map((item) => ({ ...item, funds: undefined }))
+    .sort((a, b) => b.exposure - a.exposure)
+    .slice(0, 8);
+  const topIndustries = [...industryExposure.values()]
+    .map((item) => ({ ...item, funds: undefined }))
+    .sort((a, b) => b.exposure - a.exposure)
+    .slice(0, 8);
+  const concentrationWarnings: string[] = [];
+  const largestPosition = topPositions[0];
+  if (largestPosition?.positionWeight && largestPosition.positionWeight >= 40) {
+    concentrationWarnings.push(`${largestPosition.name} 占组合约 ${largestPosition.positionWeight.toFixed(1)}%，单一持仓较集中。`);
+  }
+  const largestIndustry = topIndustries[0];
+  if (largestIndustry && largestIndustry.exposure >= 35) {
+    concentrationWarnings.push(`${largestIndustry.industryName} 暴露约 ${largestIndustry.exposure.toFixed(1)}%，行业集中度较高。`);
+  }
+  const largestOverlap = overlappingStocks[0];
+  if (largestOverlap && largestOverlap.exposure >= 8) {
+    concentrationWarnings.push(`${largestOverlap.stockName} 被 ${largestOverlap.fundCount} 只基金共同持有，组合穿透暴露约 ${largestOverlap.exposure.toFixed(1)}%。`);
+  }
+  const targetByKey = new Map(targetRows.map((target) => [target.targetKey, target]));
+  const mergedTargets = DEFAULT_PORTFOLIO_TARGETS.map((target) => ({
+    ...target,
+    ...(targetByKey.get(target.targetKey) ?? {})
+  }));
+  const fundWeight = summary.currentValue > 0 ? (itemsWithSellChecks.filter((item) => item.targetType === "fund").reduce((sum, item) => sum + (item.currentValue ?? 0), 0) / summary.currentValue) * 100 : 0;
+  const wealthWeight = summary.currentValue > 0 ? (itemsWithSellChecks.filter((item) => item.targetType === "wealth").reduce((sum, item) => sum + (item.currentValue ?? 0), 0) / summary.currentValue) * 100 : 0;
+  const currentWeightByKey = new Map<string, number>([
+    ["fund", fundWeight],
+    ["wealth", wealthWeight],
+    ["cash", 0],
+    ["single_position", largestPosition?.positionWeight ?? 0],
+    ["industry", largestIndustry?.exposure ?? 0]
+  ]);
+  const targetPlan = mergedTargets.map((target) => {
+    const currentWeight = currentWeightByKey.get(target.targetKey) ?? 0;
+    const targetWeight = target.targetWeight ?? null;
+    const maxWeight = target.maxWeight ?? null;
+    const deviation = targetWeight !== null ? currentWeight - targetWeight : null;
+    const overLimit = maxWeight !== null && currentWeight > maxWeight;
+    const offTarget = deviation !== null && Math.abs(deviation) >= 5;
+    return {
+      id: "id" in target ? target.id : null,
+      targetKey: target.targetKey,
+      label: target.label,
+      targetWeight,
+      maxWeight,
+      currentWeight,
+      deviation,
+      note: target.note,
+      status: overLimit ? "over" : offTarget ? "off" : "ok"
+    };
+  });
+
+  return {
+    items: itemsWithSellChecks,
+    summary: {
+      ...summary,
+      profitRate,
+      holdingCount: items.length,
+      fundMarketValue: items.filter((item) => item.targetType === "fund").reduce((sum, item) => sum + (item.currentValue ?? 0), 0),
+      wealthMarketValue: items.filter((item) => item.targetType === "wealth").reduce((sum, item) => sum + (item.currentValue ?? 0), 0)
+    },
+    concentration: {
+      topPositions,
+      topStocks,
+      overlappingStocks,
+      topIndustries,
+      warnings: concentrationWarnings
+    },
+    targetPlan,
+    transactions: holdings
+      .flatMap((holding) =>
+        holding.transactions.map((transaction) => ({
+          id: transaction.id,
+          targetType: holding.targetType,
+          targetKey: holding.targetKey,
+          name: holding.displayName ?? holding.fund?.name ?? holding.product?.name ?? holding.targetKey,
+          transactionType: transaction.transactionType,
+          tradeDate: transaction.tradeDate,
+          shares: transaction.shares,
+          price: transaction.price,
+          amount: transaction.amount,
+          fee: transaction.fee,
+          note: transaction.note
+        }))
+      )
+      .sort((a, b) => b.tradeDate.getTime() - a.tradeDate.getTime())
+      .slice(0, 80)
+  };
 }
 
 export async function savePortfolioHolding(input: {
@@ -1658,6 +2913,113 @@ export async function deletePortfolioHolding(id: number) {
   return { deleted: true };
 }
 
+export async function savePortfolioTransaction(input: {
+  targetType: "fund" | "wealth";
+  targetKey: string;
+  transactionType: string;
+  tradeDate?: string | null;
+  shares?: number | null;
+  price?: number | null;
+  amount?: number | null;
+  fee?: number | null;
+  note?: string | null;
+}) {
+  const targetKey = input.targetKey.trim();
+  if (!targetKey) {
+    throw new Error("targetKey is required");
+  }
+  if (!["buy", "sell", "dividend", "fee"].includes(input.transactionType)) {
+    throw new Error("transactionType must be buy, sell, dividend or fee");
+  }
+
+  const fund = input.targetType === "fund" ? await prisma.fund.findUnique({ where: { code: targetKey } }) : null;
+  const product =
+    input.targetType === "wealth" ? await prisma.wealthProduct.findUnique({ where: { registerCode: targetKey } }) : null;
+  if (input.targetType === "fund" && !fund) {
+    throw new Error("基金代码不存在");
+  }
+  if (input.targetType === "wealth" && !product) {
+    throw new Error("理财登记编码不存在");
+  }
+
+  const tradeDate = input.tradeDate ? new Date(input.tradeDate) : new Date();
+  if (Number.isNaN(tradeDate.getTime())) {
+    throw new Error("交易日期无效");
+  }
+
+  return prisma.$transaction(async (tx) => {
+    const holding = await tx.portfolioHolding.upsert({
+      where: {
+        targetType_targetKey: {
+          targetType: input.targetType,
+          targetKey
+        }
+      },
+      update: {
+        displayName: fund?.name ?? product?.name ?? null
+      },
+      create: {
+        targetType: input.targetType,
+        targetKey,
+        fundCode: input.targetType === "fund" ? targetKey : null,
+        registerCode: input.targetType === "wealth" ? targetKey : null,
+        displayName: fund?.name ?? product?.name ?? null
+      }
+    });
+
+    return tx.portfolioTransaction.create({
+      data: {
+        holdingId: holding.id,
+        targetType: input.targetType,
+        targetKey,
+        transactionType: input.transactionType,
+        tradeDate,
+        shares: input.shares ?? null,
+        price: input.price ?? null,
+        amount: input.amount ?? null,
+        fee: input.fee ?? null,
+        note: input.note ?? null
+      }
+    });
+  });
+}
+
+export async function deletePortfolioTransaction(id: number) {
+  await prisma.portfolioTransaction.deleteMany({ where: { id } });
+  return { deleted: true };
+}
+
+export async function savePortfolioTargets(input: Array<{
+  targetKey: string;
+  label: string;
+  targetWeight?: number | null;
+  maxWeight?: number | null;
+  note?: string | null;
+}>) {
+  const rows = input.filter((item) => item.targetKey && item.label);
+  await prisma.$transaction(
+    rows.map((item) =>
+      prisma.portfolioTarget.upsert({
+        where: { targetKey: item.targetKey },
+        update: {
+          label: item.label,
+          targetWeight: item.targetWeight ?? null,
+          maxWeight: item.maxWeight ?? null,
+          note: item.note ?? null
+        },
+        create: {
+          targetKey: item.targetKey,
+          label: item.label,
+          targetWeight: item.targetWeight ?? null,
+          maxWeight: item.maxWeight ?? null,
+          note: item.note ?? null
+        }
+      })
+    )
+  );
+  return { saved: rows.length };
+}
+
 export async function getFundAnnouncements(params: {
   q?: string | null;
   source?: string | null;
@@ -1697,7 +3059,13 @@ export async function getFundAnnouncements(params: {
     }),
     prisma.announcement.count({ where })
   ]);
-  return { items, total, page, pageSize, pageCount: Math.max(1, Math.ceil(total / pageSize)) };
+  return {
+    items: items.map((item) => ({ ...item, impact: classifyAnnouncementImpact(item.title, item.source) })),
+    total,
+    page,
+    pageSize,
+    pageCount: Math.max(1, Math.ceil(total / pageSize))
+  };
 }
 
 export async function getFundDividends(params: {

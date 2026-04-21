@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import type { ReactNode } from "react";
 import Link from "next/link";
+import { BackfillButton } from "@/components/BackfillButton";
 import { AddCompareButton } from "@/components/CompareTray";
 import { NavChart } from "@/components/NavChart";
 import { TrendBadge } from "@/components/TrendBadge";
@@ -40,13 +41,42 @@ export default async function FundDetailPage({ params }: PageProps) {
     changeRate: nav.dailyGrowthRate
   }));
   const oneYearReturn = fund.periodReturns.find((item) => item.rangeKey === "year_1");
+  const threeMonthReturn = fund.periodReturns.find((item) => item.rangeKey === "month_3");
   const purchaseOpen = isOpenForPurchase(fund.purchaseStatus);
   const profileReady = Boolean(fund.profile);
   const feeReady = fund.fees.length > 0;
+  const simulation = fund.investmentSimulation;
+  const shareClasses = fund.shareClassComparison.items;
+  const shareClassBreakEven = fund.shareClassComparison.breakEven;
+  const drawdownValue =
+    fund.riskMetrics.maxDrawdown === null || fund.riskMetrics.maxDrawdown === undefined
+      ? null
+      : 10000 * (1 + fund.riskMetrics.maxDrawdown / 100);
   const drawdownOk =
     fund.riskMetrics.maxDrawdown === null || fund.riskMetrics.maxDrawdown === undefined
       ? null
       : fund.riskMetrics.maxDrawdown >= -10;
+  const navSampleCount = fund.navs.length;
+  const dataCoverage = fund.dataCoverage;
+  const dataScore = dataCoverage.score;
+  const dataCoverageLabel = dataCoverage.label;
+  const legacyDataScore =
+    (navSampleCount >= 240 ? 35 : navSampleCount >= 60 ? 20 : navSampleCount >= 14 ? 10 : 0) +
+    (fund.periodReturns.filter((item) => item.rankValue !== null && item.rankValue !== undefined).length >= 5 ? 25 : 0) +
+    (profileReady ? 15 : 0) +
+    (feeReady ? 15 : 0) +
+    (fund.latestRating ? 10 : 0);
+  const dataQuality = dataScore >= 80 ? "高" : dataScore >= 55 ? "中" : "低";
+  const decisionTone =
+    dataScore < 55
+      ? "数据不足，先补历史和资料"
+      : !purchaseOpen
+        ? "申购受限，先确认交易平台状态"
+        : fund.riskMetrics.maxDrawdown !== null && fund.riskMetrics.maxDrawdown <= -20
+          ? "波动偏高，适合谨慎观察"
+          : oneYearReturn?.peerPercentile && oneYearReturn.peerPercentile >= 80
+            ? "同类表现靠前，可加入候选池继续比较"
+            : "信息可读，继续比较同类和费用";
   const holdingParams = new URLSearchParams({
     targetType: "fund",
     targetKey: fund.code
@@ -77,6 +107,49 @@ export default async function FundDetailPage({ params }: PageProps) {
       </div>
 
       <section className="rounded-md border border-line bg-white p-4 shadow-panel">
+        <div className="grid gap-3 lg:grid-cols-[1fr_220px_220px]">
+          <div>
+            <h2 className="text-lg font-semibold text-ink">一句话风险结论</h2>
+            <p className="mt-2 text-sm leading-6 text-slate-600">{decisionTone}。这不是买卖建议，实际操作前还要结合你的仓位、持有期限和可承受回撤。</p>
+          </div>
+          <DecisionMetric label="数据可信度" value={dataQuality} helper={`${dataScore}/100 · ${navSampleCount} 个净值样本`} />
+          <DecisionMetric
+            label="研究优先级"
+            value={purchaseOpen && dataScore >= 55 ? "可研究" : "先补充"}
+            helper={purchaseOpen ? "申购状态可继续核对" : "申购状态需要确认"}
+          />
+        </div>
+        <div className="mt-4 flex flex-wrap gap-3">
+          <BackfillButton action="fund_full" code={fund.code} label="一键补本基金" />
+          <BackfillButton action="fund_history" code={fund.code} label="补 3 年净值" />
+          <BackfillButton action="fund_profile" code={fund.code} label="补资料/费率/持仓" />
+        </div>
+      </section>
+
+      <section className="rounded-md border border-line bg-white p-4 shadow-panel">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-ink">数据可信度</h2>
+            <p className="mt-1 text-sm text-slate-600">{dataCoverage.summary}</p>
+          </div>
+          <div className="rounded-md border border-line bg-paper px-3 py-2 text-sm text-slate-600">
+            类型：{fund.fundType ?? "--"} · 来源：{fund.fundTypeSource ?? "--"} · 样本：{dataCoverage.navCoverageLabel}
+          </div>
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          {dataCoverage.checks.map((item) => (
+            <ChecklistItem key={item.key} label={item.label} status={item.status} detail={item.detail} />
+          ))}
+        </div>
+        {dataCoverage.missingActions.length ? (
+          <div className="mt-4 rounded-md border border-line bg-paper p-3 text-sm text-slate-600">
+            <div className="font-medium text-ink">建议补数</div>
+            <div className="mt-1">{dataCoverage.missingActions.join(" / ")}</div>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="rounded-md border border-line bg-white p-4 shadow-panel">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           <div>
             <h2 className="text-lg font-semibold text-ink">买入决策面板</h2>
@@ -102,16 +175,20 @@ export default async function FundDetailPage({ params }: PageProps) {
           <DecisionMetric
             label="近1年收益"
             value={<TrendBadge value={oneYearReturn?.rankValue} />}
-            helper={`排行日 ${formatDate(oneYearReturn?.rankDate)}`}
+            helper={
+              oneYearReturn?.peerPercentile
+                ? `同类超过 ${formatNumber(oneYearReturn.peerPercentile, 1)}%`
+                : `排行日 ${formatDate(oneYearReturn?.rankDate)}`
+            }
           />
           <DecisionMetric
             label="样本最大回撤"
             value={fund.riskMetrics.maxDrawdown === null ? "--" : `${formatNumber(fund.riskMetrics.maxDrawdown, 2)}%`}
-            helper="越接近 0，样本期跌幅压力越低"
+            helper={drawdownValue === null ? "净值样本不足" : `买入 1 万元样本低点约 ${formatNumber(drawdownValue, 0)} 元`}
           />
           <DecisionMetric
-            label="费用 / 规模"
-            value={fund.fees[0]?.feeValue ?? "--"}
+            label="近3月 / 规模"
+            value={<TrendBadge value={threeMonthReturn?.rankValue} />}
             helper={`规模 ${fund.profile?.latestScale ?? "--"}`}
           />
         </div>
@@ -126,7 +203,13 @@ export default async function FundDetailPage({ params }: PageProps) {
           <ChecklistItem
             label="收益样本可读"
             status={oneYearReturn?.rankValue === null || oneYearReturn?.rankValue === undefined ? "missing" : "ok"}
-            detail={oneYearReturn?.rankValue === null || oneYearReturn?.rankValue === undefined ? "缺少近1年收益" : "已接入近1年排行"}
+            detail={
+              oneYearReturn?.peerRank && oneYearReturn.peerTotal
+                ? `同类第 ${oneYearReturn.peerRank}/${oneYearReturn.peerTotal}`
+                : oneYearReturn?.rankValue === null || oneYearReturn?.rankValue === undefined
+                  ? "缺少近1年收益"
+                  : "已接入近1年排行"
+            }
           />
           <ChecklistItem
             label="资料与费率"
@@ -149,6 +232,47 @@ export default async function FundDetailPage({ params }: PageProps) {
         <Info label="夏普比率" value={formatNumber(fund.riskMetrics.sharpe, 2)} />
         <Info label="样本年化收益" value={<TrendBadge value={fund.riskMetrics.annualizedReturn} />} />
       </section>
+
+      {fund.fundClassification.assetMode !== "open" ? (
+        <section className="rounded-md border border-line bg-white p-4 shadow-panel">
+          <h2 className="text-lg font-semibold text-ink">专项数据</h2>
+          <p className="mt-1 text-sm text-slate-600">
+            {fund.fundClassification.assetMode === "money"
+              ? "货币基金优先看万份收益和七日年化，单位净值涨跌不适合作为主要判断。"
+              : fund.fundClassification.assetMode === "exchange"
+                ? "ETF/LOF 需要同时看场内价格、成交额和折溢价，净值涨跌不能完整反映交易成本。"
+                : fund.fundClassification.assetMode === "qdii"
+                  ? "QDII 净值通常滞后，买前需要额外留意估值日期和海外市场波动。"
+                  : "该类型基金需要结合专属指标查看。"}
+          </p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {fund.fundClassification.assetMode === "money" ? (
+              <>
+                <Info label="万份收益" value={formatNumber(fund.latestMoneyData?.tenThousandIncome, 4)} />
+                <Info label="七日年化" value={<TrendBadge value={fund.latestMoneyData?.sevenDayAnnualized} />} />
+                <Info label="货币数据日" value={formatDate(fund.latestMoneyData?.tradeDate)} />
+                <Info label="购买状态" value={fund.latestMoneyData?.purchaseStatus ?? fund.purchaseStatus ?? "--"} />
+              </>
+            ) : null}
+            {fund.fundClassification.assetMode === "exchange" ? (
+              <>
+                <Info label="场内价格" value={formatNumber(fund.latestExchangeQuote?.latestPrice, 4)} />
+                <Info label="场内涨跌" value={<TrendBadge value={fund.latestExchangeQuote?.changeRate} />} />
+                <Info label="折溢价" value={<TrendBadge value={fund.latestExchangeQuote?.discountRate} />} />
+                <Info label="成交额" value={formatNumber(fund.latestExchangeQuote?.amount, 2)} />
+              </>
+            ) : null}
+            {fund.fundClassification.assetMode === "qdii" ? (
+              <>
+                <Info label="最新净值日" value={formatDate(latest?.tradeDate)} />
+                <Info label="近 1 月" value={<TrendBadge value={fund.periodReturns.find((item) => item.rangeKey === "month_1")?.rankValue} />} />
+                <Info label="近 1 年" value={<TrendBadge value={oneYearReturn?.rankValue} />} />
+                <Info label="数据提醒" value="注意净值滞后" />
+              </>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
 
       <section className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
         <div className="rounded-md border border-line bg-white p-4 shadow-panel">
@@ -196,9 +320,113 @@ export default async function FundDetailPage({ params }: PageProps) {
                 <TrendBadge value={item.rankValue} />
               </div>
               <div className="mt-1 text-xs text-slate-500">排行日 {formatDate(item.rankDate)}</div>
+              <div className="mt-1 text-xs text-slate-500">
+                {item.peerRank && item.peerTotal
+                  ? `同类 ${item.peerRank}/${item.peerTotal} · 超过 ${formatNumber(item.peerPercentile, 1)}%`
+                  : "同类百分位不足"}
+              </div>
             </div>
           ))}
         </div>
+      </section>
+
+      <section className="rounded-md border border-line bg-white shadow-panel">
+        <div className="border-b border-line px-4 py-3">
+          <h2 className="font-semibold text-ink">A/C 份额费用对比</h2>
+          <p className="mt-1 text-sm text-slate-600">
+            按同名基金识别份额，估算 1 万元持有 30 天和 1 年的申购费与销售服务费成本。
+          </p>
+          {shareClassBreakEven ? (
+            <div className="mt-3 grid gap-3 text-sm md:grid-cols-4">
+              <div className="rounded-md border border-line bg-paper px-3 py-2">
+                <div className="text-slate-500">A/C 临界天数</div>
+                <div className="mt-1 font-semibold text-ink">
+                  {shareClassBreakEven.breakEvenDays === null ? "暂无明显临界点" : `约 ${formatNumber(shareClassBreakEven.breakEvenDays, 0)} 天`}
+                </div>
+              </div>
+              <div className="rounded-md border border-line bg-paper px-3 py-2">
+                <div className="text-slate-500">持有 30 天</div>
+                <div className="mt-1 font-semibold text-ink">{shareClassBreakEven.better30d.shareClass} 类成本低</div>
+              </div>
+              <div className="rounded-md border border-line bg-paper px-3 py-2">
+                <div className="text-slate-500">持有 90 天</div>
+                <div className="mt-1 font-semibold text-ink">{shareClassBreakEven.better90d.shareClass} 类成本低</div>
+              </div>
+              <div className="rounded-md border border-line bg-paper px-3 py-2">
+                <div className="text-slate-500">持有 1 年</div>
+                <div className="mt-1 font-semibold text-ink">{shareClassBreakEven.better365d.shareClass} 类成本低</div>
+              </div>
+            </div>
+          ) : null}
+        </div>
+        <div className="table-scroll">
+          <table className="w-full border-collapse text-left text-sm">
+            <thead className="bg-paper text-slate-600">
+              <tr>
+                <th className="px-4 py-3 font-medium">份额</th>
+                <th className="px-4 py-3 font-medium">基金</th>
+                <th className="px-4 py-3 text-right font-medium">近1年收益</th>
+                <th className="px-4 py-3 text-right font-medium">申购费</th>
+                <th className="px-4 py-3 text-right font-medium">销售服务费</th>
+                <th className="px-4 py-3 text-right font-medium">30天成本</th>
+                <th className="px-4 py-3 text-right font-medium">1年成本</th>
+                <th className="px-4 py-3 font-medium">状态</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-line">
+              {shareClasses.length <= 1 ? (
+                <tr>
+                  <td colSpan={8} className="px-4 py-6 text-center text-slate-500">
+                    暂未识别到同名 A/C 份额，或费率数据仍需补采。
+                  </td>
+                </tr>
+              ) : (
+                shareClasses.map((item) => (
+                  <tr key={item.code} className={item.isCurrent ? "bg-paper/70" : undefined}>
+                    <td className="px-4 py-3 font-medium">{item.shareClass}</td>
+                    <td className="px-4 py-3">
+                      <Link href={`/funds/${encodeURIComponent(item.code)}`} className="focus-ring rounded font-medium text-ink">
+                        {item.name}
+                      </Link>
+                      <div className="mt-1 text-xs text-slate-500">{item.code}</div>
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <TrendBadge value={item.yearReturn} />
+                    </td>
+                    <td className="px-4 py-3 text-right">{formatNumber(item.feeSummary.subscriptionRate, 2)}%</td>
+                    <td className="px-4 py-3 text-right">{formatNumber(item.feeSummary.serviceRate, 2)}%</td>
+                    <td className="px-4 py-3 text-right">¥{formatNumber(item.cost30d, 2)}</td>
+                    <td className="px-4 py-3 text-right">¥{formatNumber(item.cost365d, 2)}</td>
+                    <td className="px-4 py-3 text-slate-600">{item.purchaseStatus ?? "--"}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="rounded-md border border-line bg-white p-4 shadow-panel">
+        <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-ink">定投模拟</h2>
+            <p className="mt-1 text-sm text-slate-600">按每月 1,000 元、每月首个净值日买入估算，不含申赎费和分红再投。</p>
+          </div>
+        </div>
+        {simulation ? (
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Info label="定投期数" value={`${simulation.months} 期`} />
+            <Info label="累计投入" value={`¥${formatNumber(simulation.invested, 2)}`} />
+            <Info label="当前市值" value={`¥${formatNumber(simulation.currentValue, 2)}`} />
+            <Info label="定投收益率" value={<TrendBadge value={simulation.profitRate} />} />
+            <Info label="最大浮亏" value={<TrendBadge value={simulation.maxFloatingLoss} />} />
+            <Info label="一次性买入收益" value={<TrendBadge value={simulation.lumpProfitRate} />} />
+            <Info label="开始日期" value={formatDate(simulation.startDate)} />
+            <Info label="结束日期" value={formatDate(simulation.endDate)} />
+          </div>
+        ) : (
+          <p className="mt-4 text-sm text-slate-500">净值样本不足，暂不能模拟定投。</p>
+        )}
       </section>
 
       <section>
@@ -295,9 +523,14 @@ export default async function FundDetailPage({ params }: PageProps) {
                 className="focus-ring block rounded py-3 text-sm"
                 key={item.id}
               >
-                <span className="block font-medium text-ink">{item.title}</span>
+                <span className="flex flex-wrap items-center gap-2 font-medium text-ink">
+                  <span>{item.title}</span>
+                  <span className={`rounded-md px-2 py-1 text-xs ${announcementImpactClass(item.impact?.level)}`}>
+                    {item.impact?.label ?? "低影响"}
+                  </span>
+                </span>
                 <span className="mt-1 block text-slate-500">
-                  {item.source} · {formatDate(item.publishedAt)}
+                  {item.source} · {formatDate(item.publishedAt)} · {item.impact?.reason ?? "普通公告"}
                 </span>
               </a>
             ))
@@ -365,4 +598,14 @@ function ChecklistItem({
       <div className="mt-1 text-xs">{detail}</div>
     </div>
   );
+}
+
+function announcementImpactClass(level: string | undefined) {
+  if (level === "high") {
+    return "bg-coral/10 text-coral";
+  }
+  if (level === "medium") {
+    return "bg-steel/10 text-steel";
+  }
+  return "bg-mint/10 text-mint";
 }

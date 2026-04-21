@@ -18,7 +18,13 @@ from collector_common import (
 )
 
 
-def collect_fund_profiles(conn, seed: bool = False, limit: int | None = None) -> int:
+def collect_fund_profiles(
+    conn,
+    seed: bool = False,
+    limit: int | None = None,
+    target_codes: list[str] | None = None,
+    scope: str = "priority",
+) -> int:
     if seed:
         return 0
 
@@ -29,26 +35,41 @@ def collect_fund_profiles(conn, seed: bool = False, limit: int | None = None) ->
 
     limit = limit or int(os.getenv("FUND_PROFILE_LIMIT", "80"))
     year = os.getenv("FUND_PORTFOLIO_YEAR", str(dt.date.today().year - 1))
-    rows = conn.execute(
-        """
-        SELECT DISTINCT f.code
-        FROM Fund f
-        LEFT JOIN FundProfile fp ON fp.fundCode = f.code
-        LEFT JOIN Watchlist w ON w.targetType = 'fund' AND w.fundCode = f.code
-        LEFT JOIN FundNavDaily n ON n.id = (
-          SELECT id FROM FundNavDaily latest
-          WHERE latest.fundCode = f.code
-          ORDER BY latest.tradeDate DESC
-          LIMIT 1
-        )
-        ORDER BY
-          CASE WHEN fp.fundCode IS NULL THEN 0 ELSE 1 END,
-          CASE WHEN w.id IS NULL THEN 1 ELSE 0 END,
-          n.dailyGrowthRate DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
+    if target_codes:
+        placeholders = ",".join("?" for _ in target_codes)
+        rows = conn.execute(
+            f"SELECT code FROM Fund WHERE code IN ({placeholders}) ORDER BY code",
+            tuple(target_codes),
+        ).fetchall()
+    else:
+        scope_where = ""
+        if scope == "portfolio":
+            scope_where = "WHERE ph.id IS NOT NULL"
+        elif scope == "watchlist":
+            scope_where = "WHERE w.id IS NOT NULL"
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT f.code
+            FROM Fund f
+            LEFT JOIN FundProfile fp ON fp.fundCode = f.code
+            LEFT JOIN Watchlist w ON w.targetType = 'fund' AND w.fundCode = f.code
+            LEFT JOIN PortfolioHolding ph ON ph.targetType = 'fund' AND ph.fundCode = f.code
+            LEFT JOIN FundNavDaily n ON n.id = (
+              SELECT id FROM FundNavDaily latest
+              WHERE latest.fundCode = f.code
+              ORDER BY latest.tradeDate DESC
+              LIMIT 1
+            )
+            {scope_where}
+            ORDER BY
+              CASE WHEN ph.id IS NULL THEN 1 ELSE 0 END,
+              CASE WHEN fp.fundCode IS NULL THEN 0 ELSE 1 END,
+              CASE WHEN w.id IS NULL THEN 1 ELSE 0 END,
+              n.dailyGrowthRate DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
 
     collected = 0
     for row in rows:

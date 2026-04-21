@@ -27,6 +27,17 @@ const rangeLabels: Record<string, string> = {
   since_inception: "成立来"
 };
 
+const candidateViews = [
+  { key: "candidates", label: "观察候选池", href: "/funds/candidates", note: "按观察分筛出可继续跟踪的基金" },
+  { key: "all", label: "全量搜索", href: "/funds", note: "保留完整列表和高级筛选" },
+  { key: "watchlist", label: "我的关注", href: "/funds?view=watchlist", note: "只看关注池" },
+  { key: "strong_week", label: "近周强势", href: "/funds?view=strong_week&sort=return_desc", note: "近1周收益靠前" },
+  { key: "strong_quarter", label: "近三月强势", href: "/funds?view=strong_quarter&sort=return_desc", note: "近3月收益靠前" },
+  { key: "low_drawdown", label: "回撤较低", href: "/funds?view=low_drawdown&sort=drawdown_desc", note: "样本回撤不超过10%" },
+  { key: "open_purchase", label: "开放申购", href: "/funds?view=open_purchase", note: "排除明显暂停申购" },
+  { key: "data_ready", label: "数据较完整", href: "/funds?view=data_ready", note: "历史、资料、费率较完整" }
+];
+
 export default async function FundsPage({ searchParams }: PageProps) {
   const rawParams = await searchParams;
   const params = {
@@ -34,6 +45,7 @@ export default async function FundsPage({ searchParams }: PageProps) {
     type: single(rawParams.type),
     direction: single(rawParams.direction),
     purchaseStatus: single(rawParams.purchaseStatus),
+    view: single(rawParams.view) ?? "all",
     returnRange: single(rawParams.returnRange) ?? "year_1",
     minReturn: single(rawParams.minReturn),
     maxDrawdown: single(rawParams.maxDrawdown),
@@ -44,14 +56,14 @@ export default async function FundsPage({ searchParams }: PageProps) {
     pageSize: single(rawParams.pageSize)
   };
   const result = await getFundList(params);
-  const selectedRange = params.returnRange ?? "year_1";
+  const selectedRange = params.view === "strong_week" ? "week_1" : params.view === "strong_quarter" ? "month_3" : params.returnRange ?? "year_1";
   const selectedRangeLabel = rangeLabels[selectedRange] ?? "近1年";
 
   return (
     <div className="space-y-5">
       <div>
         <h1 className="text-2xl font-semibold text-ink">基金</h1>
-        <p className="mt-2 text-sm text-slate-600">按申购状态、周期收益和样本回撤筛选候选基金。</p>
+        <p className="mt-2 text-sm text-slate-600">先用候选池缩小范围，再按申购状态、周期收益、样本回撤和数据完整度筛选。</p>
         <div className="mt-3 flex flex-wrap gap-2 text-sm">
           <Link href="/funds/rankings" className="focus-ring rounded-md border border-line bg-white px-3 py-2 text-steel">
             查看基金排行
@@ -80,7 +92,23 @@ export default async function FundsPage({ searchParams }: PageProps) {
         </div>
       </div>
 
+      <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        {candidateViews.map((item) => (
+          <Link
+            key={item.key}
+            href={item.href}
+            className={`focus-ring rounded-md border p-3 text-sm ${
+              params.view === item.key ? "border-ink bg-ink text-white" : "border-line bg-white text-slate-700"
+            }`}
+          >
+            <span className="block font-medium">{item.label}</span>
+            <span className={`mt-1 block text-xs ${params.view === item.key ? "text-white/75" : "text-slate-500"}`}>{item.note}</span>
+          </Link>
+        ))}
+      </section>
+
       <form className="grid gap-3 rounded-md border border-line bg-white p-4 shadow-panel lg:grid-cols-[1fr_130px_130px_120px_120px_140px_160px_100px]">
+        {params.view !== "all" ? <input type="hidden" name="view" value={params.view} /> : null}
         <input
           name="q"
           defaultValue={params.q}
@@ -160,6 +188,7 @@ export default async function FundsPage({ searchParams }: PageProps) {
                 <th className="px-4 py-3 text-right font-medium">单位净值</th>
                 <th className="px-4 py-3 text-right font-medium">{selectedRangeLabel}收益</th>
                 <th className="px-4 py-3 text-right font-medium">样本回撤</th>
+                <th className="px-4 py-3 text-right font-medium">数据可信度</th>
                 <th className="px-4 py-3 text-right font-medium">日增长率</th>
                 <th className="px-4 py-3 font-medium">交易日</th>
                 <th className="px-4 py-3 font-medium">申购</th>
@@ -175,7 +204,12 @@ export default async function FundsPage({ searchParams }: PageProps) {
                     </Link>
                     <div className="mt-1 text-xs text-slate-500">{row.code}</div>
                   </td>
-                  <td className="px-4 py-3 text-slate-600">{row.fundType ?? "--"}</td>
+                  <td className="px-4 py-3 text-slate-600">
+                    {row.fundType ?? "--"}
+                    {row.fundTypeSource && row.fundTypeSource !== "source" ? (
+                      <div className="mt-1 text-xs text-slate-500">推断</div>
+                    ) : null}
+                  </td>
                   <td className="px-4 py-3 text-right">{formatNumber(row.unitNav)}</td>
                   <td className="px-4 py-3 text-right">
                     <TrendBadge value={row.selectedReturn} />
@@ -183,6 +217,13 @@ export default async function FundsPage({ searchParams }: PageProps) {
                   </td>
                   <td className="px-4 py-3 text-right text-slate-700">
                     {row.maxDrawdown === null ? "--" : `${formatNumber(row.maxDrawdown, 2)}%`}
+                  </td>
+                  <td className="px-4 py-3 text-right text-slate-700">
+                    {formatNumber(row.dataCompleteness, 0)}
+                    {row.dataQualityLabel ? <span className="ml-1 text-xs text-slate-500">{row.dataQualityLabel}</span> : null}
+                    <div className="mt-1 text-xs text-slate-500">
+                      {row.navSampleCount ?? 0} 日样本 · {row.hasProfile ? "资料" : "缺资料"} · {row.hasFee ? "费率" : "缺费率"}
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-right">
                     <TrendBadge value={row.dailyGrowthRate} />
@@ -207,6 +248,7 @@ export default async function FundsPage({ searchParams }: PageProps) {
           type: params.type,
           direction: params.direction,
           purchaseStatus: params.purchaseStatus,
+          view: params.view === "all" ? undefined : params.view,
           returnRange: params.returnRange,
           minReturn: params.minReturn,
           maxDrawdown: params.maxDrawdown,

@@ -5,7 +5,14 @@ import os
 from collector_common import clean_text, date_iso, find_col, parse_date, to_float, upsert_fund_nav
 
 
-def collect_fund_history(conn, seed: bool = False, limit: int | None = None) -> int:
+def collect_fund_history(
+    conn,
+    seed: bool = False,
+    limit: int | None = None,
+    history_days: int | None = None,
+    target_codes: list[str] | None = None,
+    scope: str = "priority",
+) -> int:
     if seed:
         return 0
 
@@ -15,22 +22,55 @@ def collect_fund_history(conn, seed: bool = False, limit: int | None = None) -> 
         return 0
 
     limit = limit or int(os.getenv("FUND_HISTORY_LIMIT", "30"))
-    rows = conn.execute(
-        """
-        SELECT DISTINCT f.code
-        FROM Fund f
-        LEFT JOIN Watchlist w ON w.targetType = 'fund' AND w.fundCode = f.code
-        LEFT JOIN FundNavDaily n ON n.id = (
-          SELECT id FROM FundNavDaily latest
-          WHERE latest.fundCode = f.code
-          ORDER BY latest.tradeDate DESC
-          LIMIT 1
-        )
-        ORDER BY CASE WHEN w.id IS NULL THEN 1 ELSE 0 END, n.dailyGrowthRate DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
+    history_days = history_days or int(os.getenv("FUND_HISTORY_DAYS", "756"))
+    if target_codes:
+        placeholders = ",".join("?" for _ in target_codes)
+        rows = conn.execute(
+            f"SELECT code FROM Fund WHERE code IN ({placeholders}) ORDER BY code",
+            tuple(target_codes),
+        ).fetchall()
+    else:
+        scope_where = ""
+        if scope == "portfolio":
+            scope_where = "WHERE ph.id IS NOT NULL"
+        elif scope == "watchlist":
+            scope_where = "WHERE w.id IS NOT NULL"
+        rows = conn.execute(
+            f"""
+            WITH latest_rank AS (
+              SELECT fundCode, MAX(rankValue) AS bestRankValue
+              FROM FundRankDaily
+              WHERE rangeKey IN ('week_1', 'month_1', 'month_3', 'month_6', 'year_1')
+              GROUP BY fundCode
+            ),
+            nav_count AS (
+              SELECT fundCode, COUNT(*) AS value
+              FROM FundNavDaily
+              GROUP BY fundCode
+            )
+            SELECT DISTINCT f.code
+            FROM Fund f
+            LEFT JOIN Watchlist w ON w.targetType = 'fund' AND w.fundCode = f.code
+            LEFT JOIN PortfolioHolding ph ON ph.targetType = 'fund' AND ph.fundCode = f.code
+            LEFT JOIN latest_rank r ON r.fundCode = f.code
+            LEFT JOIN nav_count nc ON nc.fundCode = f.code
+            LEFT JOIN FundNavDaily n ON n.id = (
+              SELECT id FROM FundNavDaily latest
+              WHERE latest.fundCode = f.code
+              ORDER BY latest.tradeDate DESC
+              LIMIT 1
+            )
+            {scope_where}
+            ORDER BY
+              CASE WHEN ph.id IS NULL THEN 1 ELSE 0 END,
+              CASE WHEN w.id IS NULL THEN 1 ELSE 0 END,
+              CASE WHEN COALESCE(nc.value, 0) < 240 THEN 0 ELSE 1 END,
+              r.bestRankValue DESC,
+              n.dailyGrowthRate DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
 
     total = 0
     for item in rows:
@@ -51,7 +91,7 @@ def collect_fund_history(conn, seed: bool = False, limit: int | None = None) -> 
             continue
 
         previous = None
-        for _, row in df.tail(180).iterrows():
+        for _, row in df.tail(history_days).iterrows():
             parsed_date = parse_date(row[date_col])
             if not parsed_date:
                 continue

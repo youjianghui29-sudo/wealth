@@ -19,6 +19,8 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 60000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -94,6 +96,73 @@ def clean_text(value: Any) -> str | None:
     return text
 
 
+def normalize_fund_type(value: Any) -> str | None:
+    text = clean_text(value)
+    if not text or text in {"??", "未知", "unknown", "None"}:
+        return None
+    if "ETF" in text.upper():
+        return "ETF"
+    if "LOF" in text.upper():
+        return "LOF"
+    if "QDII" in text.upper():
+        return "QDII"
+    if "FOF" in text.upper():
+        return "FOF"
+    if "REIT" in text.upper():
+        return "REITs"
+    if re.search(r"货币|现金|理财", text):
+        return "货币型"
+    if re.search(r"债券|债基|纯债|短债|中短债|转债", text):
+        return "债券型"
+    if re.search(r"指数|联接|增强", text):
+        return "指数型"
+    if "股票" in text:
+        return "股票型"
+    if re.search(r"混合|灵活|偏股|偏债|平衡", text):
+        return "混合型"
+    if re.search(r"商品|黄金|白银|原油|有色", text):
+        return "商品型"
+    return text
+
+
+def infer_fund_type(name: Any = None, code: Any = None, fund_type: Any = None, detail: Any = None, benchmark: Any = None) -> str | None:
+    normalized = normalize_fund_type(fund_type)
+    if normalized:
+        return normalized
+    detail_type = normalize_fund_type(detail)
+    if detail_type:
+        return detail_type
+
+    text = " ".join(filter(None, [clean_text(name), clean_text(detail), clean_text(benchmark)]))
+    upper_text = text.upper()
+    code_text = clean_text(code) or ""
+    if "ETF" in upper_text:
+        return "ETF"
+    if "LOF" in upper_text:
+        return "LOF"
+    if re.search(r"QDII|全球|海外|美国|纳斯达克|标普|恒生|港股|越南|印度|德国|日经", text):
+        return "QDII"
+    if re.search(r"FOF|养老目标|目标日期|目标风险", text):
+        return "FOF"
+    if "REIT" in upper_text or "基础设施" in text:
+        return "REITs"
+    if re.search(r"货币|现金|天天|余额|活期|保证金", text):
+        return "货币型"
+    if re.search(r"债券|纯债|短债|中短债|转债|信用债|利率债", text):
+        return "债券型"
+    if re.search(r"指数|联接|增强|沪深|中证|创业板|科创|红利", text):
+        return "指数型"
+    if re.search(r"股票|量化|科技|消费|医药|新能源|半导体|军工|白酒", text):
+        return "股票型"
+    if re.search(r"混合|灵活|优选|精选|成长|价值|均衡|优势|创新|回报|策略|主题", text):
+        return "混合型"
+    if re.search(r"黄金|白银|原油|商品|有色|豆粕", text):
+        return "商品型"
+    if re.match(r"^(15|16|18|50|51|52|56|58)\d{4}$", code_text):
+        return "场内基金"
+    return None
+
+
 def find_col(columns: Iterable[str], include: Iterable[str], exclude: Iterable[str] = ()) -> str | None:
     includes = tuple(include)
     excludes = tuple(exclude)
@@ -137,6 +206,7 @@ def upsert_fund(conn: sqlite3.Connection, *, code: str, name: str, fund_type: st
                 purchase_status: str | None = None, redeem_status: str | None = None,
                 source: str = "akshare") -> None:
     now = utc_now()
+    inferred_type = infer_fund_type(name=name, code=code, fund_type=fund_type)
     conn.execute(
         """
         INSERT INTO Fund (code, name, fundType, purchaseStatus, redeemStatus, source, updatedAt, createdAt)
@@ -149,7 +219,7 @@ def upsert_fund(conn: sqlite3.Connection, *, code: str, name: str, fund_type: st
           source = excluded.source,
           updatedAt = excluded.updatedAt
         """,
-        (code, name, fund_type, purchase_status, redeem_status, source, now, now),
+        (code, name, inferred_type, purchase_status, redeem_status, source, now, now),
     )
 
 
@@ -228,6 +298,12 @@ def upsert_fund_profile(
     source: str = "akshare",
 ) -> None:
     now = utc_now()
+    inferred_type = infer_fund_type(
+        code=fund_code,
+        fund_type=fund_type_detail,
+        detail=fund_type_detail,
+        benchmark=benchmark,
+    )
     conn.execute(
         """
         INSERT INTO FundProfile (
@@ -271,6 +347,17 @@ def upsert_fund_profile(
             now,
         ),
     )
+    if inferred_type:
+        conn.execute(
+            """
+            UPDATE Fund
+            SET fundType = ?,
+                updatedAt = ?
+            WHERE code = ?
+              AND (fundType IS NULL OR fundType = '' OR fundType = '??' OR fundType = '未知')
+            """,
+            (inferred_type, now, fund_code),
+        )
 
 
 def upsert_fund_holding(
@@ -725,6 +812,18 @@ def create_sync_job(conn: sqlite3.Connection, job_type: str) -> int:
     )
     conn.commit()
     return int(cursor.lastrowid)
+
+
+def update_sync_job_message(conn: sqlite3.Connection, job_id: int, message: str) -> None:
+    conn.execute(
+        """
+        UPDATE SyncJob
+        SET message = ?
+        WHERE id = ?
+        """,
+        (message, job_id),
+    )
+    conn.commit()
 
 
 def finish_sync_job(conn: sqlite3.Connection, job_id: int, *, status: str,
