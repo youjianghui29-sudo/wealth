@@ -18,6 +18,7 @@ const navItems = [
 
 const fundLinks = [
   { href: "/funds/candidates", label: "观察候选池" },
+  { href: "/funds/watchlist", label: "关注工作台" },
   { href: "/funds/rankings", label: "收益排行" },
   { href: "/funds/money", label: "货币基金" },
   { href: "/funds/exchange", label: "场内基金" },
@@ -29,6 +30,7 @@ const fundLinks = [
 ];
 
 const toolLinks = [
+  { href: "/brief", label: "每日简报" },
   { href: "/compare", label: "产品对比" },
   { href: "/alerts", label: "提醒中心" }
 ];

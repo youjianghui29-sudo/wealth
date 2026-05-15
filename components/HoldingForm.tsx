@@ -92,10 +92,14 @@ export function TransactionForm({
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(Object.fromEntries(form.entries()))
     });
-    const payload = (await response.json()) as { error?: string };
+    const payload = (await response.json()) as { error?: string; transaction?: { duplicate?: boolean } };
     setSaving(false);
     if (!response.ok) {
       setMessage(payload.error ?? "保存失败");
+      return;
+    }
+    if (payload.transaction?.duplicate) {
+      setMessage("已存在相同流水，已跳过重复记录");
       return;
     }
     window.location.reload();
@@ -104,36 +108,68 @@ export function TransactionForm({
   return (
     <form className="rounded-md border border-line bg-white p-4 shadow-panel" onSubmit={submit}>
       <h2 className="text-lg font-semibold text-ink">记录交易流水</h2>
-      <p className="mt-1 text-sm text-slate-600">买入、卖出、现金分红和额外手续费会进入真实盈亏计算。</p>
-      <div className="mt-4 grid gap-3 md:grid-cols-[110px_1fr_120px_130px_120px_120px_120px_120px]">
-        <select name="targetType" className="focus-ring rounded-md border border-line px-3 py-2" defaultValue={defaultTargetType}>
-          <option value="fund">基金</option>
-          <option value="wealth">理财</option>
-        </select>
-        <input
-          name="targetKey"
-          className="focus-ring rounded-md border border-line px-3 py-2"
-          placeholder="基金代码或理财登记编码"
-          defaultValue={defaultTargetKey}
-          required
-        />
-        <select name="transactionType" className="focus-ring rounded-md border border-line px-3 py-2" defaultValue="buy">
-          <option value="buy">买入</option>
-          <option value="sell">卖出</option>
-          <option value="dividend">分红</option>
-          <option value="fee">手续费</option>
-        </select>
-        <input name="tradeDate" className="focus-ring rounded-md border border-line px-3 py-2" type="date" required />
-        <input name="shares" className="focus-ring rounded-md border border-line px-3 py-2" placeholder="份额" inputMode="decimal" />
-        <input
-          name="price"
-          className="focus-ring rounded-md border border-line px-3 py-2"
-          placeholder="成交净值"
-          inputMode="decimal"
-          defaultValue={defaultPrice}
-        />
-        <input name="amount" className="focus-ring rounded-md border border-line px-3 py-2" placeholder="成交金额" inputMode="decimal" />
-        <input name="fee" className="focus-ring rounded-md border border-line px-3 py-2" placeholder="手续费" inputMode="decimal" />
+      <p className="mt-1 text-sm text-slate-600">买入后补齐申请日期、确认日期、确认净值、确认份额和手续费，用于后续成交确认核对。</p>
+      <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>标的类型</span>
+          <select name="targetType" className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink" defaultValue={defaultTargetType}>
+            <option value="fund">基金</option>
+            <option value="wealth">理财</option>
+          </select>
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>基金代码/登记编码</span>
+          <input
+            name="targetKey"
+            className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink"
+            placeholder="例如 000001"
+            defaultValue={defaultTargetKey}
+            required
+          />
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>交易类型</span>
+          <select name="transactionType" className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink" defaultValue="buy">
+            <option value="buy">买入</option>
+            <option value="sell">卖出</option>
+            <option value="dividend">分红</option>
+            <option value="fee">手续费</option>
+          </select>
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>交易平台</span>
+          <input name="platform" className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink" placeholder="支付宝/银行/券商" />
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>申请日期</span>
+          <input name="applicationDate" className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink" type="date" />
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>确认日期</span>
+          <input name="tradeDate" className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink" type="date" required />
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>确认份额</span>
+          <input name="shares" className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink" placeholder="份额" inputMode="decimal" />
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>确认净值</span>
+          <input
+            name="price"
+            className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink"
+            placeholder="净值"
+            inputMode="decimal"
+            defaultValue={defaultPrice}
+          />
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>确认金额</span>
+          <input name="amount" className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink" placeholder="金额" inputMode="decimal" />
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          <span>手续费</span>
+          <input name="fee" className="focus-ring rounded-md border border-line px-3 py-2 text-sm text-ink" placeholder="费用" inputMode="decimal" />
+        </label>
       </div>
       <textarea name="note" className="focus-ring mt-3 min-h-16 w-full rounded-md border border-line px-3 py-2" placeholder="备注：平台、分红方式、操作原因" />
       <div className="mt-3 flex items-center gap-3">
@@ -152,6 +188,7 @@ export function TransactionImportForm() {
     { key: "targetKey", label: "基金代码/登记编码" },
     { key: "transactionType", label: "交易类型" },
     { key: "tradeDate", label: "交易日期" },
+    { key: "applicationDate", label: "申请日期" },
     { key: "shares", label: "份额" },
     { key: "price", label: "成交净值" },
     { key: "amount", label: "金额" },

@@ -11,12 +11,22 @@ function toNumber(value: unknown) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function toOptionalText(value: unknown) {
+  const text = String(value ?? "").trim();
+  return text ? text : null;
+}
+
 export async function POST(request: NextRequest) {
   const body = (await request.json()) as Record<string, unknown>;
   if (body.targetType !== "fund" && body.targetType !== "wealth") {
     return NextResponse.json({ error: "targetType must be fund or wealth" }, { status: 400 });
   }
   try {
+    const noteParts = [
+      toOptionalText(body.applicationDate) ? `申请日期：${toOptionalText(body.applicationDate)}` : null,
+      toOptionalText(body.platform) ? `交易平台：${toOptionalText(body.platform)}` : null,
+      toOptionalText(body.note)
+    ].filter((item): item is string => Boolean(item));
     const transaction = await savePortfolioTransaction({
       targetType: body.targetType,
       targetKey: String(body.targetKey ?? ""),
@@ -26,7 +36,7 @@ export async function POST(request: NextRequest) {
       price: toNumber(body.price),
       amount: toNumber(body.amount),
       fee: toNumber(body.fee),
-      note: body.note ? String(body.note) : null
+      note: noteParts.length ? noteParts.join("\n") : null
     });
     return NextResponse.json({ transaction });
   } catch (error) {

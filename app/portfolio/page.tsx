@@ -4,6 +4,7 @@ import { MetricCard } from "@/components/MetricCard";
 import { PortfolioTargetForm } from "@/components/PortfolioTargetForm";
 import { TrendBadge } from "@/components/TrendBadge";
 import { formatDate, formatNumber } from "@/lib/format";
+import { buildTradeConfirmationChecklist } from "@/lib/fund-ux";
 import { getPortfolioDashboard } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
@@ -16,10 +17,39 @@ function single(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+function noteField(note: string | null | undefined, label: string) {
+  const match = String(note ?? "").match(new RegExp(`${label}[：:]\\s*([^\\n]+)`));
+  return match?.[1]?.trim() ?? null;
+}
+
+function dateKey(value: Date | string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  const date = typeof value === "string" ? new Date(value) : value;
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+}
+
 export default async function PortfolioPage({ searchParams }: PageProps) {
   const rawParams = await searchParams;
   const targetType = single(rawParams.targetType) === "wealth" ? "wealth" : "fund";
   const dashboard = await getPortfolioDashboard();
+  const confirmationItems = dashboard.transactions
+    .filter((transaction) => transaction.transactionType === "buy")
+    .slice(0, 8)
+    .map((transaction) => ({
+      transaction,
+      checklist: buildTradeConfirmationChecklist({
+        applicationAmount: transaction.amount,
+        applicationDate: noteField(transaction.note, "申请日期"),
+        confirmationDate: dateKey(transaction.tradeDate),
+        confirmedNav: transaction.price,
+        confirmedShares: transaction.shares,
+        fee: transaction.fee
+      })
+    }));
+  const confirmedCount = confirmationItems.filter((item) => item.checklist.status === "confirmed").length;
+  const reconciliationWarnings = dashboard.items.filter((item) => item.reconciliation?.status === "warn");
 
   return (
     <div className="space-y-5">
@@ -54,6 +84,32 @@ export default async function PortfolioPage({ searchParams }: PageProps) {
       </section>
 
       <PortfolioTargetForm targets={dashboard.targetPlan} />
+
+      <section className="rounded-md border border-line bg-white p-4 shadow-panel">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-ink">持仓/流水一致性</h2>
+            <p className="mt-1 text-sm text-slate-600">用交易流水反推份额和净成本，和手工持仓做差异核对。</p>
+          </div>
+          <span className={`rounded-md px-3 py-2 text-sm font-medium ${reconciliationWarnings.length ? "bg-amber-100 text-amber-700" : "bg-mint/10 text-mint"}`}>
+            {reconciliationWarnings.length ? `${reconciliationWarnings.length} 项需核对` : "当前一致"}
+          </span>
+        </div>
+        <div className="mt-4 grid gap-3 lg:grid-cols-3">
+          {(reconciliationWarnings.length ? reconciliationWarnings : dashboard.items.slice(0, 3)).map((item) => (
+            <div key={`reconcile-${item.id}`} className="rounded-md border border-line bg-paper p-3 text-sm">
+              <div className="font-medium text-ink">{item.name}</div>
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-600">
+                <div>份额差：{item.reconciliation?.shareDifference ?? "--"}</div>
+                <div>成本差：{item.reconciliation?.costDifference ?? "--"}</div>
+                <div>流水份额：{formatNumber(item.reconciliation?.derivedShares, 2)}</div>
+                <div>流水成本：{formatNumber(item.reconciliation?.derivedCostAmount, 2)}</div>
+              </div>
+            </div>
+          ))}
+          {dashboard.items.length === 0 ? <p className="text-sm text-slate-500">暂无持仓，录入后会自动核对。</p> : null}
+        </div>
+      </section>
 
       <section className="grid gap-4 xl:grid-cols-[0.9fr_1.1fr]">
         <div className="rounded-md border border-line bg-white p-4 shadow-panel">
@@ -161,6 +217,47 @@ export default async function PortfolioPage({ searchParams }: PageProps) {
         defaultPrice={single(rawParams.costPrice)}
       />
 
+      <section className="rounded-md border border-line bg-white p-4 shadow-panel">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-ink">成交确认完整度</h2>
+            <p className="mt-1 text-sm text-slate-600">买入后核对申请日期、确认日期、确认净值、确认份额和手续费，避免持仓成本失真。</p>
+          </div>
+          <span className="rounded-md border border-line bg-paper px-3 py-2 text-sm text-slate-600">
+            已完整 {confirmedCount}/{confirmationItems.length}
+          </span>
+        </div>
+        <div className="mt-4 grid gap-3 lg:grid-cols-2">
+          {confirmationItems.length === 0 ? (
+            <p className="text-sm text-slate-500">暂无买入流水，录入后会生成成交确认清单。</p>
+          ) : (
+            confirmationItems.map(({ transaction, checklist }) => (
+              <div key={transaction.id} className="rounded-md border border-line bg-paper p-3 text-sm">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="font-medium text-ink">{transaction.name}</div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      {transaction.targetKey} · 确认日 {formatDate(transaction.tradeDate)}
+                    </div>
+                  </div>
+                  <span className={`shrink-0 rounded-md px-2 py-1 text-xs font-medium ${checklist.status === "confirmed" ? "bg-mint/10 text-mint" : "bg-amber-100 text-amber-700"}`}>
+                    {checklist.status === "confirmed" ? "已确认" : "待补齐"}
+                  </span>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                  {checklist.checks.map((check) => (
+                    <span key={`${transaction.id}-${check.label}`} className={`rounded-md border px-2 py-1 ${check.ok ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-slate-200 bg-white text-slate-500"}`}>
+                      {check.label}
+                    </span>
+                  ))}
+                </div>
+                <div className="mt-2 text-xs text-slate-500">{checklist.summary}</div>
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+
       <TransactionImportForm />
 
       <section className="rounded-md border border-line bg-white shadow-panel">
@@ -247,7 +344,7 @@ export default async function PortfolioPage({ searchParams }: PageProps) {
           <h2 className="font-semibold text-ink">最近交易流水</h2>
           <p className="mt-1 text-sm text-slate-600">流水是成本、分红、手续费和真实盈亏的优先口径。</p>
         </div>
-        <div className="table-scroll">
+        <div className="hidden md:block table-scroll">
           <table className="w-full border-collapse text-left text-sm">
             <thead className="bg-paper text-slate-600">
               <tr>
@@ -296,6 +393,51 @@ export default async function PortfolioPage({ searchParams }: PageProps) {
               )}
             </tbody>
           </table>
+        </div>
+        <div className="grid gap-3 p-4 md:hidden">
+          {dashboard.items.length === 0 ? (
+            <div className="rounded-md border border-line bg-paper p-4 text-center text-sm text-slate-500">
+              暂无持仓。先录入一个基金代码或理财登记编码。
+            </div>
+          ) : (
+            dashboard.items.map((item) => (
+              <div key={`holding-card-${item.id}`} className="rounded-md border border-line bg-paper p-3 text-sm">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <Link
+                      href={item.targetType === "fund" ? `/funds/${encodeURIComponent(item.targetKey)}` : `/wealth/${encodeURIComponent(item.targetKey)}`}
+                      className="focus-ring rounded font-semibold text-ink"
+                    >
+                      {item.name}
+                    </Link>
+                    <div className="mt-1 text-xs text-slate-500">{item.targetKey}</div>
+                  </div>
+                  <TrendBadge value={item.profitRate} />
+                </div>
+                <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-600">
+                  <div className="rounded-md border border-line bg-white px-3 py-2">
+                    <div>当前市值</div>
+                    <div className="mt-1 font-medium text-ink">{formatNumber(item.currentValue, 2)}</div>
+                  </div>
+                  <div className="rounded-md border border-line bg-white px-3 py-2">
+                    <div>今日盈亏</div>
+                    <div className="mt-1 font-medium text-ink">{formatNumber(item.dailyProfit, 2)}</div>
+                  </div>
+                  <div className="rounded-md border border-line bg-white px-3 py-2">
+                    <div>仓位</div>
+                    <div className="mt-1 font-medium text-ink">{formatNumber(item.positionWeight, 1)}%</div>
+                  </div>
+                  <div className="rounded-md border border-line bg-white px-3 py-2">
+                    <div>流水核对</div>
+                    <div className="mt-1 font-medium text-ink">{item.reconciliation?.status === "warn" ? "需核对" : item.reconciliation?.status === "ok" ? "一致" : "仅手工"}</div>
+                  </div>
+                </div>
+                <div className="mt-3">
+                  <DeleteHoldingButton id={item.id} />
+                </div>
+              </div>
+            ))
+          )}
         </div>
       </section>
     </div>

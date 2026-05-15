@@ -1,6 +1,27 @@
 import { Prisma } from "@prisma/client";
 import { buildFundDataCoverage } from "@/lib/data-quality";
 import { classifyFund, fundTypeFilterSqlHint } from "@/lib/fund-classification";
+import {
+  assignCandidateTiers,
+  buildHoldingReconciliation,
+  buildDailyHighlights,
+  buildDashboardSnapshotState,
+  buildCashLedgerSummary,
+  buildTransactionSignature,
+  buildRebalancePlan,
+  buildDecisionReviewState,
+  buildSyncJobState,
+  chooseAlternativeFunds,
+  estimateKnownFeeCost,
+  evaluateAdvancedAlertRule,
+  evaluateUserAlertRule,
+  isSnapshotFresh,
+  summarizeDataSourceHealth,
+  normalizeAlertActionState,
+  normalizeInvestmentPreferences,
+  normalizeWatchlistStatus,
+  parseCompareTargets
+} from "@/lib/fund-ux";
 import { ensureSqlitePragmas, prisma } from "@/lib/prisma";
 import type {
   ExchangeFundItem,
@@ -12,6 +33,7 @@ import type {
   PagedResult,
   WealthListItem
 } from "@/lib/types";
+import type { AlertActionState } from "@/lib/fund-ux";
 
 const DEFAULT_PAGE_SIZE = 30;
 const MAX_PAGE_SIZE = 100;
@@ -51,6 +73,39 @@ type AlertItem = {
   message: string;
   metric: string;
 };
+
+type AlertCenterResult = { items: AlertItem[] };
+
+let alertCenterCache: { generatedAt: string; result: AlertCenterResult } | null = null;
+
+type DataCoverageResult = {
+  fundTotal: number;
+  wealthTotal: number;
+  fundWithAnyNav: number;
+  metrics: Array<ReturnType<typeof coverageMetric>>;
+  recommendations: string[];
+};
+
+type SummaryResult = {
+  fundCount: number;
+  wealthCount: number;
+  wealthUpdatedCount: number;
+  fundLatestNavDate: string | null;
+  fundLatestNavRows: number;
+  wealthLatestNavDate: string | null;
+  fundDistribution: {
+    positive: number;
+    negative: number;
+    flat: number;
+  };
+  latestSync: Awaited<ReturnType<typeof getLatestSyncJob>>;
+  topGainers: FundListItem[];
+  topLosers: FundListItem[];
+  dailyHighlights: ReturnType<typeof buildDailyHighlights>;
+};
+
+let dataCoverageCache: { generatedAt: string; result: DataCoverageResult } | null = null;
+let summaryCache: { generatedAt: string; result: SummaryResult } | null = null;
 
 function classifyAnnouncementImpact(title: string | null | undefined, source: string | null | undefined) {
   const text = `${title ?? ""} ${source ?? ""}`;
@@ -273,9 +328,7 @@ function estimateClassCost(
   holdingDays: number,
   amount = 10000
 ) {
-  const subscriptionCost = amount * ((feeSummary.subscriptionRate ?? 0) / 100);
-  const serviceCost = amount * ((feeSummary.serviceRate ?? 0) / 100) * (holdingDays / 365);
-  return subscriptionCost + serviceCost;
+  return estimateKnownFeeCost(feeSummary, holdingDays, amount);
 }
 
 function buildShareClassBreakEven(
@@ -284,8 +337,8 @@ function buildShareClassBreakEven(
     name: string;
     shareClass: string;
     feeSummary: ReturnType<typeof summarizeFeeRows>;
-    cost30d: number;
-    cost365d: number;
+    cost30d: number | null;
+    cost365d: number | null;
   }>
 ) {
   const aClass = items.find((item) => item.shareClass === "A");
@@ -304,6 +357,15 @@ function buildShareClassBreakEven(
   const cheapest = (days: number) => {
     const aCost = estimateClassCost(aClass.feeSummary, days);
     const cCost = estimateClassCost(cClass.feeSummary, days);
+    if (aCost === null && cCost === null) {
+      return { shareClass: "--", code: aClass.code, cost: null };
+    }
+    if (aCost === null) {
+      return { shareClass: "C", code: cClass.code, cost: cCost };
+    }
+    if (cCost === null) {
+      return { shareClass: "A", code: aClass.code, cost: aCost };
+    }
     return aCost <= cCost
       ? { shareClass: "A", code: aClass.code, cost: aCost }
       : { shareClass: "C", code: cClass.code, cost: cCost };
@@ -583,7 +645,7 @@ export async function getLatestSyncJob() {
 }
 
 export async function getRecentSyncJobs(limit = 30) {
-  return withDatabaseRetry(() => prisma.$queryRaw<
+  const rows = await withDatabaseRetry(() => prisma.$queryRaw<
     Array<{
       id: number;
       jobType: string;
@@ -612,9 +674,70 @@ export async function getRecentSyncJobs(limit = 30) {
     ORDER BY startedAt DESC
     LIMIT ${limit}
   `);
+  return rows.map((job) => ({
+    ...job,
+    syncState: buildSyncJobState({
+      status: job.status,
+      startedAt: job.startedAt,
+      stuckAfterHours: 4
+    })
+  }));
 }
 
-export async function getDataCoverage() {
+export async function markSyncJobFailed(id: number, reason = "manual mark failed") {
+  return prisma.syncJob.update({
+    where: { id },
+    data: {
+      status: "failed",
+      finishedAt: new Date(),
+      failedSources: "manual",
+      message: reason
+    }
+  });
+}
+
+export async function getDataSourceHealth(limit = 80) {
+  const jobs = await getRecentSyncJobs(limit);
+  return summarizeDataSourceHealth(jobs.map((job) => ({
+    jobType: job.jobType,
+    status: job.status,
+    startedAt: job.startedAt ?? new Date().toISOString(),
+    finishedAt: job.finishedAt,
+    failedSources: job.failedSources,
+    message: job.message
+  })));
+}
+
+export async function getDashboardSnapshotStatus(snapshotKey = "home-summary") {
+  const snapshot = await prisma.dashboardSnapshot.findUnique({ where: { snapshotKey } });
+  return {
+    snapshot,
+    state: buildDashboardSnapshotState(snapshot?.generatedAt ?? null)
+  };
+}
+
+export async function saveDashboardSnapshot(snapshotKey: string, payload: unknown, ttlMinutes = 30) {
+  const expiresAt = new Date(Date.now() + ttlMinutes * 60000);
+  return prisma.dashboardSnapshot.upsert({
+    where: { snapshotKey },
+    update: {
+      payload: JSON.stringify(payload),
+      generatedAt: new Date(),
+      expiresAt
+    },
+    create: {
+      snapshotKey,
+      payload: JSON.stringify(payload),
+      expiresAt
+    }
+  });
+}
+
+export async function getDataCoverage(): Promise<DataCoverageResult> {
+  const now = new Date().toISOString();
+  if (dataCoverageCache && isSnapshotFresh(dataCoverageCache.generatedAt, now, 10)) {
+    return dataCoverageCache.result;
+  }
   const [
     fundTotalRows,
     fundTypeRows,
@@ -854,16 +977,87 @@ export async function getDataCoverage() {
     "银行理财公开源只能抓到可见样本；若要全市场，需要接入普益标准、Wind、Choice、iFinD 或用 WEALTH_PRODUCTS_JSON 导入授权数据。"
   ];
 
-  return {
+  const result = {
     fundTotal,
     wealthTotal,
     fundWithAnyNav: toCount(fundNavFundsRows[0]?.value),
     metrics,
     recommendations
   };
+  dataCoverageCache = { generatedAt: now, result };
+  return result;
 }
 
-export async function getSummary() {
+async function getLatestFundMovers(direction: "asc" | "desc"): Promise<FundListItem[]> {
+  const orderSql =
+    direction === "asc"
+      ? Prisma.sql`latest.dailyGrowthRate ASC NULLS LAST, f.code ASC`
+      : Prisma.sql`latest.dailyGrowthRate DESC NULLS LAST, f.code ASC`;
+  const rows = await prisma.$queryRaw<FundListItem[]>`
+    WITH latest_nav AS (
+      SELECT nav.*
+      FROM FundNavDaily nav
+      JOIN (
+        SELECT fundCode, MAX(tradeDate) AS tradeDate
+        FROM FundNavDaily
+        GROUP BY fundCode
+      ) latestDate
+        ON latestDate.fundCode = nav.fundCode AND latestDate.tradeDate = nav.tradeDate
+    )
+    SELECT
+      f.code,
+      f.name,
+      f.fundType,
+      f.purchaseStatus,
+      f.redeemStatus,
+      latest.tradeDate,
+      latest.unitNav,
+      latest.accumulatedNav,
+      latest.dailyGrowthValue,
+      latest.dailyGrowthRate,
+      latest.growthRateSource,
+      NULL AS selectedReturnRange,
+      NULL AS selectedReturnDate,
+      NULL AS selectedReturn,
+      NULL AS maxDrawdown,
+      NULL AS volatility,
+      NULL AS navSampleCount,
+      NULL AS dataCompleteness,
+      0 AS hasProfile,
+      0 AS hasFee,
+      0 AS watched
+    FROM Fund f
+    JOIN latest_nav latest ON latest.fundCode = f.code
+    WHERE latest.dailyGrowthRate IS NOT NULL
+    ORDER BY ${orderSql}
+    LIMIT 5
+  `;
+
+  return rows.map((row) => {
+    const classification = classifyFund({
+      code: row.code,
+      name: row.name,
+      fundType: row.fundType
+    });
+    return {
+      ...row,
+      fundType: classification.displayType,
+      fundTypeSource: classification.source,
+      assetMode: classification.assetMode,
+      navSampleCount: null,
+      dataCompleteness: null,
+      hasProfile: false,
+      hasFee: false,
+      watched: false
+    };
+  });
+}
+
+export async function getSummary(): Promise<SummaryResult> {
+  const now = new Date().toISOString();
+  if (summaryCache && isSnapshotFresh(summaryCache.generatedAt, now, 5)) {
+    return summaryCache.result;
+  }
   const [fundCount, wealthCount, latestSync, latestFundRows, latestWealthRows] =
     await Promise.all([
       prisma.fund.count(),
@@ -883,8 +1077,8 @@ export async function getSummary() {
             LIMIT 1
           )
       `,
-      prisma.$queryRaw<Array<{ updated: number }>>`
-        SELECT COUNT(*) AS updated
+      prisma.$queryRaw<Array<{ updated: number; latestDate: string | null }>>`
+        SELECT COUNT(*) AS updated, MAX(latest.navDate) AS latestDate
         FROM WealthProduct p
         JOIN WealthNavDaily latest
           ON latest.id = (
@@ -896,26 +1090,106 @@ export async function getSummary() {
       `
     ]);
 
-  const [topGainers, topLosers] = await Promise.all([
-    getFundList({ page: 1, pageSize: 5, sort: "growth_desc" }),
-    getFundList({ page: 1, pageSize: 5, sort: "growth_asc" })
+  const [topGainers, topLosers, strongCandidateRows, watchedMoveRows, latestFundNavRows] = await Promise.all([
+    getLatestFundMovers("desc"),
+    getLatestFundMovers("asc"),
+    prisma.$queryRaw<Array<{ value: number }>>`
+      WITH latest_rank_date AS (
+        SELECT rangeKey, MAX(rankDate) AS rankDate
+        FROM FundRankDaily
+        WHERE rangeKey IN ('month_3', 'month_6', 'year_1')
+        GROUP BY rangeKey
+      ),
+      rank_pivot AS (
+        SELECT
+          r.fundCode,
+          MAX(CASE WHEN r.rangeKey = 'month_3' THEN r.rankValue END) AS month3Return,
+          MAX(CASE WHEN r.rangeKey = 'month_6' THEN r.rankValue END) AS month6Return,
+          MAX(CASE WHEN r.rangeKey = 'year_1' THEN r.rankValue END) AS year1Return
+        FROM FundRankDaily r
+        JOIN latest_rank_date latestDate
+          ON latestDate.rangeKey = r.rangeKey AND latestDate.rankDate = r.rankDate
+        WHERE r.rangeKey IN ('month_3', 'month_6', 'year_1')
+        GROUP BY r.fundCode
+      ),
+      navStat AS (
+        SELECT fundCode, COUNT(*) AS navSampleCount
+        FROM FundNavDaily
+        WHERE unitNav IS NOT NULL
+        GROUP BY fundCode
+      )
+      SELECT COUNT(*) AS value
+      FROM (
+        SELECT f.code
+        FROM Fund f
+        JOIN rank_pivot rp ON rp.fundCode = f.code
+        JOIN navStat ON navStat.fundCode = f.code
+        WHERE navStat.navSampleCount >= 60
+          AND (rp.month3Return IS NOT NULL OR rp.month6Return IS NOT NULL OR rp.year1Return IS NOT NULL)
+        ORDER BY rp.year1Return DESC NULLS LAST, rp.month6Return DESC NULLS LAST, rp.month3Return DESC NULLS LAST
+        LIMIT 60
+      ) strongPool
+    `,
+    prisma.$queryRaw<Array<{ code: string; name: string; dailyGrowthRate: number | null }>>`
+      SELECT f.code, f.name, latest.dailyGrowthRate
+      FROM Watchlist w
+      JOIN Fund f ON f.code = w.fundCode
+      LEFT JOIN FundNavDaily latest
+        ON latest.id = (
+          SELECT id FROM FundNavDaily nav
+          WHERE nav.fundCode = f.code
+          ORDER BY nav.tradeDate DESC
+          LIMIT 1
+        )
+      WHERE w.targetType = 'fund'
+      ORDER BY ABS(COALESCE(latest.dailyGrowthRate, 0)) DESC
+      LIMIT 8
+    `,
+    prisma.$queryRaw<Array<{ latestDate: string | null; rows: number }>>`
+      SELECT MAX(tradeDate) AS latestDate, COUNT(*) AS rows
+      FROM FundNavDaily
+      WHERE tradeDate = (SELECT MAX(tradeDate) FROM FundNavDaily)
+    `
   ]);
 
   const distribution = latestFundRows[0] ?? { positive: 0, negative: 0, flat: 0 };
 
-  return {
+  const result = {
     fundCount,
     wealthCount,
     wealthUpdatedCount: Number(latestWealthRows[0]?.updated ?? 0),
+    fundLatestNavDate: latestFundNavRows[0]?.latestDate ?? null,
+    fundLatestNavRows: Number(latestFundNavRows[0]?.rows ?? 0),
+    wealthLatestNavDate: latestWealthRows[0]?.latestDate ?? null,
     fundDistribution: {
       positive: Number(distribution.positive ?? 0),
       negative: Number(distribution.negative ?? 0),
       flat: Number(distribution.flat ?? 0)
     },
     latestSync,
-    topGainers: topGainers.items,
-    topLosers: topLosers.items
+    topGainers,
+    topLosers,
+    dailyHighlights: buildDailyHighlights({
+      fundNavDate: latestFundNavRows[0]?.latestDate ?? null,
+      asOfDate: new Date().toISOString(),
+      newStrongCandidates: Number(strongCandidateRows[0]?.value ?? 0),
+      watchedMoves: watchedMoveRows,
+      rankingMoves: topGainers.slice(0, 2).map((item) => ({
+        code: item.code,
+        name: item.name,
+        rangeLabel: "最新日",
+        rankValue: item.dailyGrowthRate
+      })),
+      latestSyncStatus: latestSync?.status ?? null
+    })
   };
+  summaryCache = { generatedAt: now, result };
+  try {
+    await saveDashboardSnapshot("home-summary", result, 30);
+  } catch {
+    // Snapshot cache is an optimization; page data should still render if it fails.
+  }
+  return result;
 }
 
 export async function getFundList(params: {
@@ -1365,15 +1639,31 @@ async function attachCandidateRiskMetrics<T extends FundCandidateItem>(items: T[
   });
 }
 
+type FundCandidatePoolResult = PagedResult<FundCandidateItem> & { summary: FundCandidateSummary };
+
+const fundCandidatePoolCache = new Map<string, { generatedAt: string; result: FundCandidatePoolResult }>();
+
 export async function getFundCandidatePool(params: {
   type?: string | null;
   grade?: string | null;
   sort?: string | null;
   page?: string | number | null;
   pageSize?: string | number | null;
-}): Promise<PagedResult<FundCandidateItem> & { summary: FundCandidateSummary }> {
+}): Promise<FundCandidatePoolResult> {
   const page = toPositiveInt(params.page, 1);
   const pageSize = clampPageSize(params.pageSize);
+  const cacheKey = JSON.stringify({
+    type: params.type ?? "",
+    grade: params.grade ?? "all",
+    sort: params.sort ?? "score",
+    page,
+    pageSize
+  });
+  const cached = fundCandidatePoolCache.get(cacheKey);
+  const now = new Date().toISOString();
+  if (cached && isSnapshotFresh(cached.generatedAt, now, 20)) {
+    return cached.result;
+  }
   const filters: Prisma.Sql[] = [
     Prisma.sql`navStat.navSampleCount >= 60`,
     Prisma.sql`(rp.month3Return IS NOT NULL OR rp.month6Return IS NOT NULL OR rp.year1Return IS NOT NULL)`
@@ -1540,11 +1830,14 @@ export async function getFundCandidatePool(params: {
   });
 
   const withRisk = await attachCandidateRiskMetrics(baseItems);
+  const ranked = assignCandidateTiers(
+    [...withRisk].sort((a, b) => b.observationScore - a.observationScore || (b.year1Return ?? -999) - (a.year1Return ?? -999))
+  );
   const grade = params.grade ?? "all";
-  const filtered = withRisk.filter((item) => {
-    if (grade === "strong") return item.observationScore >= 75;
-    if (grade === "watchable") return item.observationScore >= 60 && item.observationScore < 75;
-    if (grade === "cautious") return item.observationScore < 60;
+  const filtered = ranked.filter((item) => {
+    if (grade === "strong") return item.observationTier === "strong";
+    if (grade === "watchable") return item.observationTier === "watchable";
+    if (grade === "cautious") return item.observationTier === "cautious";
     return true;
   });
 
@@ -1565,14 +1858,14 @@ export async function getFundCandidatePool(params: {
   const start = (page - 1) * pageSize;
   const items = sorted.slice(start, start + pageSize);
   const summary: FundCandidateSummary = {
-    totalScanned: withRisk.length,
-    strongCount: withRisk.filter((item) => item.observationScore >= 75).length,
-    watchableCount: withRisk.filter((item) => item.observationScore >= 60 && item.observationScore < 75).length,
-    cautiousCount: withRisk.filter((item) => item.observationScore < 60).length,
+    totalScanned: ranked.length,
+    strongCount: ranked.filter((item) => item.observationTier === "strong").length,
+    watchableCount: ranked.filter((item) => item.observationTier === "watchable").length,
+    cautiousCount: ranked.filter((item) => item.observationTier === "cautious").length,
     generatedAt: new Date().toISOString()
   };
 
-  return {
+  const result = {
     items,
     total,
     page,
@@ -1580,6 +1873,8 @@ export async function getFundCandidatePool(params: {
     pageCount: Math.max(1, Math.ceil(total / pageSize)),
     summary
   };
+  fundCandidatePoolCache.set(cacheKey, { generatedAt: summary.generatedAt, result });
+  return result;
 }
 
 async function getPeerPercentiles(input: {
@@ -1689,6 +1984,16 @@ export async function getFundDetail(code: string) {
         orderBy: [{ feeType: "asc" }, { id: "asc" }],
         take: 20
       },
+      holdings: {
+        where: { ratio: { not: null } },
+        orderBy: [{ reportPeriod: "desc" }, { ratio: "desc" }],
+        take: 30
+      },
+      industries: {
+        where: { ratio: { not: null } },
+        orderBy: [{ reportDate: "desc" }, { ratio: "desc" }],
+        take: 30
+      },
       dividends: {
         orderBy: [{ registrationDate: "desc" }, { paymentDate: "desc" }, { createdAt: "desc" }],
         take: 12
@@ -1743,7 +2048,7 @@ export async function getFundDetail(code: string) {
     fundTypeDetail: fund.profile?.fundTypeDetail,
     benchmark: fund.profile?.benchmark
   });
-  const [peerPercentiles, shareClassComparison, holdingCounts, latestMoneyData, latestExchangeQuote] = await Promise.all([
+  const [peerPercentiles, shareClassComparison, holdingCounts, latestMoneyData, latestExchangeQuote, navSampleTotal] = await Promise.all([
     getPeerPercentiles({ fundCode: fund.code, fundType: classification.normalizedType, periodReturns: basePeriodReturns }),
     getShareClassComparison(fund.code, fund.name),
     Promise.all([
@@ -1758,6 +2063,9 @@ export async function getFundDetail(code: string) {
     prisma.fundExchangeQuote.findFirst({
       where: { fundCode: code },
       orderBy: [{ tradeDate: "desc" }, { createdAt: "desc" }]
+    }),
+    prisma.fundNavDaily.count({
+      where: { fundCode: code, unitNav: { not: null } }
     })
   ]);
   const periodReturns = basePeriodReturns.map((period) => ({
@@ -1848,6 +2156,7 @@ export async function getFundDetail(code: string) {
     holdingCounts,
     latestMoneyData,
     latestExchangeQuote,
+    navSampleTotal,
     navs: orderedNavs,
     announcements: classifiedAnnouncements,
     periodReturns,
@@ -1858,6 +2167,35 @@ export async function getFundDetail(code: string) {
     warnings,
     watched: fund.watchlistEntries.length > 0
   };
+}
+
+export async function getFundAlternatives(currentCode: string, fundType: string | null | undefined, maxAlternatives = 5) {
+  const pool = await getFundCandidatePool({
+    type: fundType ?? null,
+    page: 1,
+    pageSize: 100,
+    sort: "score"
+  });
+  return chooseAlternativeFunds({
+    currentCode,
+    fundType: fundType ?? null,
+    candidates: pool.items,
+    maxAlternatives
+  }).map((item) => ({
+    code: item.code,
+    name: item.name,
+    fundType: item.fundType,
+    observationScore: item.observationScore,
+    observationTier: item.observationTier ?? null,
+    maxDrawdown: item.maxDrawdown,
+    volatility: item.volatility,
+    year1Return: item.year1Return,
+    month6Return: item.month6Return,
+    peerPercentile: item.peerPercentile,
+    dataScore: item.dataScore,
+    purchaseStatus: item.purchaseStatus,
+    risks: item.risks
+  }));
 }
 
 export async function getFundNavHistory(
@@ -2378,6 +2716,132 @@ export async function getWealthProductDetail(registerCode: string) {
   };
 }
 
+function parseWatchlistNote(note: string | null) {
+  let payload: Record<string, unknown> = {};
+  if (note) {
+    try {
+      const parsed = JSON.parse(note);
+      if (parsed && typeof parsed === "object") {
+        payload = parsed as Record<string, unknown>;
+      }
+    } catch {
+      payload = { reviewNote: note };
+    }
+  }
+  const preferences = normalizeInvestmentPreferences(payload);
+  return {
+    ...preferences,
+    observationStatus: normalizeWatchlistStatus(payload.observationStatus),
+    buyCondition: typeof payload.buyCondition === "string" ? payload.buyCondition : "",
+    rejectCondition: typeof payload.rejectCondition === "string" ? payload.rejectCondition : "",
+    reviewDate: typeof payload.reviewDate === "string" ? payload.reviewDate : "",
+    reviewNote: typeof payload.reviewNote === "string" ? payload.reviewNote : ""
+  };
+}
+
+async function getPortfolioQuickSnapshot() {
+  const holdings = await prisma.portfolioHolding.findMany({
+    include: {
+      fund: {
+        include: {
+          navs: { orderBy: { tradeDate: "desc" }, take: 1 },
+          fees: { orderBy: [{ feeType: "asc" }, { id: "asc" }], take: 20 }
+        }
+      },
+      product: {
+        include: {
+          navs: { orderBy: { navDate: "desc" }, take: 1 }
+        }
+      }
+    },
+    take: 300
+  });
+  const baseItems = holdings.map((holding) => {
+    const latestFundNav = holding.fund?.navs[0];
+    const latestWealthNav = holding.product?.navs[0];
+    const latestPrice = latestFundNav?.unitNav ?? latestWealthNav?.netValue ?? null;
+    const shares =
+      holding.shares ??
+      (holding.costAmount && holding.costPrice && holding.costPrice > 0 ? holding.costAmount / holding.costPrice : null);
+    const currentValue = shares && latestPrice ? shares * latestPrice : holding.costAmount;
+    const profit = currentValue !== null && holding.costAmount !== null ? currentValue - holding.costAmount : null;
+    const profitRate = profit !== null && holding.costAmount && holding.costAmount > 0 ? (profit / holding.costAmount) * 100 : null;
+    const feeSummary = holding.fund ? summarizeFeeRows(holding.fund.fees) : null;
+    return {
+      targetType: holding.targetType,
+      targetKey: holding.targetKey,
+      currentValue,
+      profitRate,
+      holdingDays: daysBetween(holding.purchaseDate, latestFundNav?.tradeDate ?? latestWealthNav?.navDate ?? new Date()),
+      redemptionRate: feeSummary?.redemptionRate ?? null
+    };
+  });
+  const totalValue = baseItems.reduce((sum, item) => sum + (item.currentValue ?? 0), 0);
+  return baseItems.map((item) => ({
+    ...item,
+    positionWeight: totalValue > 0 && item.currentValue ? (item.currentValue / totalValue) * 100 : null
+  }));
+}
+
+export async function getFundWatchlistWorkbench() {
+  const [rows, portfolio] = await Promise.all([
+    prisma.watchlist.findMany({
+    where: { targetType: { in: ["fund", "wealth"] } },
+    include: {
+      fund: {
+        include: {
+          navs: { orderBy: { tradeDate: "desc" }, take: 1 },
+          ranks: { where: { rangeKey: "year_1" }, orderBy: [{ rankDate: "desc" }, { createdAt: "desc" }], take: 1 },
+          profile: true
+        }
+      },
+      product: {
+        include: {
+          navs: { orderBy: { navDate: "desc" }, take: 1 }
+        }
+      }
+    },
+    orderBy: [{ createdAt: "desc" }],
+    take: 300
+    }),
+    getPortfolioQuickSnapshot()
+  ]);
+  const portfolioByTarget = new Map(portfolio.map((item) => [`${item.targetType}:${item.targetKey}`, item]));
+
+  const items = rows.map((row) => {
+    const decision = parseWatchlistNote(row.note);
+    const fund = row.fund;
+    const product = row.product;
+    const portfolioItem = portfolioByTarget.get(`${row.targetType}:${row.targetKey}`);
+    const fundNav = fund?.navs[0];
+    const productNav = product?.navs[0];
+    const targetType = row.targetType === "wealth" ? "wealth" : "fund";
+    const targetKey = row.targetKey;
+    return {
+      id: row.id,
+      targetType,
+      targetKey,
+      name: fund?.name ?? product?.name ?? targetKey,
+      href: targetType === "fund" ? `/funds/${encodeURIComponent(targetKey)}` : `/wealth/${encodeURIComponent(targetKey)}`,
+      latestDate: fundNav?.tradeDate ?? productNav?.navDate ?? null,
+      latestValue: fundNav?.unitNav ?? productNav?.netValue ?? null,
+      dailyRate: fundNav?.dailyGrowthRate ?? productNav?.dailyChangeRate ?? null,
+      yearReturn: fund?.ranks[0]?.rankValue ?? null,
+      purchaseStatus: fund?.purchaseStatus ?? product?.saleStatus ?? null,
+      manager: fund?.profile?.managerNames ?? product?.managerName ?? product?.issuer ?? null,
+      createdAt: row.createdAt,
+      held: Boolean(portfolioItem),
+      profitRate: portfolioItem?.profitRate ?? null,
+      positionWeight: portfolioItem?.positionWeight ?? null,
+      holdingDays: portfolioItem?.holdingDays ?? null,
+      redemptionRate: portfolioItem?.redemptionRate ?? null,
+      ...decision
+    };
+  });
+
+  return { items };
+}
+
 export async function toggleWatchlist(input: {
   targetType: "fund" | "wealth";
   code: string;
@@ -2441,9 +2905,294 @@ export async function toggleWatchlist(input: {
   return { watched: false };
 }
 
+export async function saveWatchlistDecision(input: {
+  targetType: "fund" | "wealth";
+  code: string;
+  settings: Record<string, unknown>;
+}) {
+  const code = input.code.trim();
+  if (!code) {
+    throw new Error("code is required");
+  }
+  const note = JSON.stringify({
+    riskProfile: input.settings.riskProfile,
+    plannedAmount: input.settings.plannedAmount,
+    maxDrawdownTolerance: input.settings.maxDrawdownTolerance,
+    targetReturn: input.settings.targetReturn,
+    observationStatus: input.settings.observationStatus,
+    buyCondition: input.settings.buyCondition,
+    rejectCondition: input.settings.rejectCondition,
+    reviewDate: input.settings.reviewDate,
+    reviewNote: input.settings.reviewNote
+  });
+  const fundCode = input.targetType === "fund" ? code : null;
+  const registerCode = input.targetType === "wealth" ? code : null;
+  await prisma.watchlist.upsert({
+    where: {
+      targetType_targetKey: {
+        targetType: input.targetType,
+        targetKey: code
+      }
+    },
+    update: {
+      note
+    },
+    create: {
+      targetType: input.targetType,
+      targetKey: code,
+      fundCode,
+      registerCode,
+      note
+    }
+  });
+  return { watched: true };
+}
+
+export async function getAlertRulesForTarget(targetType: "fund" | "wealth", targetKey: string) {
+  return prisma.alertRule.findMany({
+    where: {
+      targetType,
+      targetKey
+    },
+    orderBy: [{ enabled: "desc" }, { createdAt: "desc" }],
+    take: 20
+  });
+}
+
+export async function saveAlertRule(input: {
+  targetType: "fund" | "wealth";
+  targetKey: string;
+  metric: string;
+  threshold?: number | null;
+  note?: string | null;
+}) {
+  const targetKey = input.targetKey.trim();
+  if (!targetKey) {
+    throw new Error("targetKey is required");
+  }
+  if (!["daily_drop", "take_profit", "peer_below", "position_over", "manager_change", "consecutive_drop", "peer_lag", "drawdown_new_high"].includes(input.metric)) {
+    throw new Error("metric is invalid");
+  }
+
+  const fund = input.targetType === "fund" ? await prisma.fund.findUnique({ where: { code: targetKey } }) : null;
+  const product =
+    input.targetType === "wealth" ? await prisma.wealthProduct.findUnique({ where: { registerCode: targetKey } }) : null;
+  if (input.targetType === "fund" && !fund) {
+    throw new Error("基金代码不存在");
+  }
+  if (input.targetType === "wealth" && !product) {
+    throw new Error("理财登记编码不存在");
+  }
+
+  const rule = await prisma.alertRule.create({
+    data: {
+      targetType: input.targetType,
+      targetKey,
+      fundCode: input.targetType === "fund" ? targetKey : null,
+      registerCode: input.targetType === "wealth" ? targetKey : null,
+      metric: input.metric,
+      threshold: input.metric === "manager_change" ? null : (input.threshold ?? null),
+      note: input.note ?? null,
+      enabled: true
+    }
+  });
+  alertCenterCache = null;
+  return { rule };
+}
+
+export async function getAlertActionStates() {
+  const rows = await prisma.alertAction.findMany({
+    orderBy: { updatedAt: "desc" },
+    take: 500
+  });
+  const states: Record<string, AlertActionState | undefined> = {};
+  for (const row of rows) {
+    const state = normalizeAlertActionState({
+      action: row.action,
+      until: row.until ? row.until.toISOString().slice(0, 10) : undefined
+    });
+    if (state) {
+      states[row.alertId] = state;
+    }
+  }
+  return states;
+}
+
+export async function saveAlertAction(input: { alertId: string; action: unknown; until?: unknown; note?: string | null }) {
+  const alertId = input.alertId.trim();
+  const state = normalizeAlertActionState({ action: input.action, until: input.until });
+  if (!alertId) {
+    throw new Error("alertId is required");
+  }
+  if (!state) {
+    throw new Error("alert action is invalid");
+  }
+  const until = state.action === "snooze" && state.until ? new Date(`${state.until}T00:00:00.000Z`) : null;
+  const row = await prisma.alertAction.upsert({
+    where: { alertId },
+    update: {
+      action: state.action,
+      until,
+      note: input.note ?? null
+    },
+    create: {
+      alertId,
+      action: state.action,
+      until,
+      note: input.note ?? null
+    }
+  });
+  return { action: row };
+}
+
+export async function clearAlertActions() {
+  await prisma.alertAction.deleteMany({});
+  return { cleared: true };
+}
+
+export async function getCashDashboard() {
+  const accounts = await prisma.cashAccount.findMany({
+    include: {
+      transactions: {
+        orderBy: [{ transactionDate: "desc" }, { id: "desc" }],
+        take: 200
+      }
+    },
+    orderBy: { updatedAt: "desc" }
+  });
+  const accountItems = accounts.map((account) => {
+    const ledger = buildCashLedgerSummary(account.transactions);
+    const openingValue = Number(account.openingValue ?? 0);
+    return {
+      id: account.id,
+      name: account.name,
+      currency: account.currency,
+      openingValue,
+      balance: Number((openingValue + ledger.balance).toFixed(2)),
+      inflow: ledger.inflow,
+      outflow: ledger.outflow,
+      transactionCount: account.transactions.length,
+      note: account.note
+    };
+  });
+  return {
+    accounts: accountItems,
+    summary: {
+      balance: accountItems.reduce((sum, item) => sum + item.balance, 0),
+      inflow: accountItems.reduce((sum, item) => sum + item.inflow, 0),
+      outflow: accountItems.reduce((sum, item) => sum + item.outflow, 0),
+      accountCount: accountItems.length
+    },
+    transactions: accounts.flatMap((account) =>
+      account.transactions.map((transaction) => ({
+        ...transaction,
+        accountName: account.name
+      }))
+    )
+  };
+}
+
+export async function saveCashAccount(input: { name: string; openingValue?: number | null; note?: string | null }) {
+  const name = input.name.trim();
+  if (!name) {
+    throw new Error("cash account name is required");
+  }
+  return prisma.cashAccount.upsert({
+    where: { name },
+    update: {
+      openingValue: input.openingValue ?? 0,
+      note: input.note ?? null
+    },
+    create: {
+      name,
+      openingValue: input.openingValue ?? 0,
+      note: input.note ?? null
+    }
+  });
+}
+
+export async function saveCashTransaction(input: {
+  accountId: number;
+  transactionType: string;
+  transactionDate?: string | null;
+  amount?: number | null;
+  relatedTarget?: string | null;
+  note?: string | null;
+}) {
+  const amount = Number(input.amount ?? 0);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("cash transaction amount must be positive");
+  }
+  if (!["deposit", "withdraw", "buy", "sell", "dividend", "fee", "interest", "transfer_in", "transfer_out"].includes(input.transactionType)) {
+    throw new Error("cash transaction type is invalid");
+  }
+  return prisma.cashTransaction.create({
+    data: {
+      accountId: input.accountId,
+      transactionType: input.transactionType,
+      transactionDate: input.transactionDate ? new Date(input.transactionDate) : new Date(),
+      amount,
+      relatedTarget: input.relatedTarget ?? null,
+      note: input.note ?? null
+    }
+  });
+}
+
+export async function getDecisionRecords(limit = 80) {
+  const rows = await prisma.decisionRecord.findMany({
+    orderBy: [{ status: "asc" }, { reviewDate: "asc" }, { createdAt: "desc" }],
+    take: limit
+  });
+  const nowDate = new Date().toISOString().slice(0, 10);
+  return rows.map((row) => ({
+    ...row,
+    reviewState: buildDecisionReviewState({
+      reviewDate: row.reviewDate ? row.reviewDate.toISOString().slice(0, 10) : null,
+      status: row.status
+    }, nowDate)
+  }));
+}
+
+export async function saveDecisionRecord(input: {
+  targetType: "fund" | "wealth";
+  targetKey: string;
+  decisionType: string;
+  reason?: string | null;
+  plannedAmount?: number | null;
+  reviewDate?: string | null;
+}) {
+  const targetKey = input.targetKey.trim();
+  if (!targetKey) {
+    throw new Error("targetKey is required");
+  }
+  if (!["buy", "reject", "watch", "sell_review"].includes(input.decisionType)) {
+    throw new Error("decisionType is invalid");
+  }
+  return prisma.decisionRecord.create({
+    data: {
+      targetType: input.targetType,
+      targetKey,
+      decisionType: input.decisionType,
+      reason: input.reason ?? null,
+      plannedAmount: input.plannedAmount ?? null,
+      reviewDate: input.reviewDate ? new Date(input.reviewDate) : null
+    }
+  });
+}
+
+export async function closeDecisionRecord(id: number, outcomeNote?: string | null) {
+  return prisma.decisionRecord.update({
+    where: { id },
+    data: {
+      status: "closed",
+      outcomeNote: outcomeNote ?? null
+    }
+  });
+}
+
 export async function getPortfolioDashboard() {
   await ensureSqlitePragmas();
-  const [holdings, targetRows] = await Promise.all([
+  const [holdings, targetRows, cash] = await Promise.all([
     prisma.portfolioHolding.findMany({
       orderBy: [{ targetType: "asc" }, { updatedAt: "desc" }],
       include: {
@@ -2463,7 +3212,8 @@ export async function getPortfolioDashboard() {
         }
       }
     }),
-    prisma.portfolioTarget.findMany()
+    prisma.portfolioTarget.findMany(),
+    getCashDashboard()
   ]);
 
   function aggregateTransactions(
@@ -2539,6 +3289,11 @@ export async function getPortfolioDashboard() {
     const latestPrice = latestFundNav?.unitNav ?? latestWealthNav?.netValue ?? null;
     const previousPrice = previousFundNav?.unitNav ?? previousWealthNav?.netValue ?? null;
     const transactionSummary = aggregateTransactions(holding.transactions);
+    const reconciliation = buildHoldingReconciliation({
+      manualShares: holding.shares,
+      manualCostAmount: holding.costAmount,
+      transactions: holding.transactions
+    });
     const shares =
       transactionSummary.shares ??
       holding.shares ??
@@ -2590,6 +3345,7 @@ export async function getPortfolioDashboard() {
       realizedIncome: transactionSummary.realizedIncome,
       dividendIncome: transactionSummary.dividendIncome,
       feeAmount: transactionSummary.feeAmount,
+      reconciliation,
       latestTransactionDate: transactionSummary.latestTransactionDate,
       priceDate: latestFundNav?.tradeDate ?? latestWealthNav?.navDate ?? null,
       note: holding.note
@@ -2787,12 +3543,16 @@ export async function getPortfolioDashboard() {
     ...target,
     ...(targetByKey.get(target.targetKey) ?? {})
   }));
-  const fundWeight = summary.currentValue > 0 ? (itemsWithSellChecks.filter((item) => item.targetType === "fund").reduce((sum, item) => sum + (item.currentValue ?? 0), 0) / summary.currentValue) * 100 : 0;
-  const wealthWeight = summary.currentValue > 0 ? (itemsWithSellChecks.filter((item) => item.targetType === "wealth").reduce((sum, item) => sum + (item.currentValue ?? 0), 0) / summary.currentValue) * 100 : 0;
+  const fundMarketValue = items.filter((item) => item.targetType === "fund").reduce((sum, item) => sum + (item.currentValue ?? 0), 0);
+  const wealthMarketValue = items.filter((item) => item.targetType === "wealth").reduce((sum, item) => sum + (item.currentValue ?? 0), 0);
+  const totalWithCash = summary.currentValue + cash.summary.balance;
+  const fundWeight = totalWithCash > 0 ? (fundMarketValue / totalWithCash) * 100 : 0;
+  const wealthWeight = totalWithCash > 0 ? (wealthMarketValue / totalWithCash) * 100 : 0;
+  const cashWeight = totalWithCash > 0 ? (cash.summary.balance / totalWithCash) * 100 : 0;
   const currentWeightByKey = new Map<string, number>([
     ["fund", fundWeight],
     ["wealth", wealthWeight],
-    ["cash", 0],
+    ["cash", cashWeight],
     ["single_position", largestPosition?.positionWeight ?? 0],
     ["industry", largestIndustry?.exposure ?? 0]
   ]);
@@ -2815,6 +3575,17 @@ export async function getPortfolioDashboard() {
       status: overLimit ? "over" : offTarget ? "off" : "ok"
     };
   });
+  const rebalancePlan = buildRebalancePlan({
+    totalValue: totalWithCash,
+    targets: targetPlan.map((target) => ({
+      key: target.targetKey,
+      label: target.label,
+      currentWeight: target.currentWeight,
+      targetWeight: target.targetWeight,
+      maxWeight: target.maxWeight
+    })),
+    driftThresholdPercent: 5
+  });
 
   return {
     items: itemsWithSellChecks,
@@ -2822,8 +3593,10 @@ export async function getPortfolioDashboard() {
       ...summary,
       profitRate,
       holdingCount: items.length,
-      fundMarketValue: items.filter((item) => item.targetType === "fund").reduce((sum, item) => sum + (item.currentValue ?? 0), 0),
-      wealthMarketValue: items.filter((item) => item.targetType === "wealth").reduce((sum, item) => sum + (item.currentValue ?? 0), 0)
+      fundMarketValue,
+      wealthMarketValue,
+      cashValue: cash.summary.balance,
+      totalValue: totalWithCash
     },
     concentration: {
       topPositions,
@@ -2833,6 +3606,8 @@ export async function getPortfolioDashboard() {
       warnings: concentrationWarnings
     },
     targetPlan,
+    rebalancePlan,
+    cash,
     transactions: holdings
       .flatMap((holding) =>
         holding.transactions.map((transaction) => ({
@@ -2947,6 +3722,17 @@ export async function savePortfolioTransaction(input: {
     throw new Error("交易日期无效");
   }
 
+  const nextSignature = buildTransactionSignature({
+    targetType: input.targetType,
+    targetKey,
+    transactionType: input.transactionType,
+    tradeDate,
+    shares: input.shares,
+    price: input.price,
+    amount: input.amount,
+    fee: input.fee
+  });
+
   return prisma.$transaction(async (tx) => {
     const holding = await tx.portfolioHolding.upsert({
       where: {
@@ -2966,6 +3752,33 @@ export async function savePortfolioTransaction(input: {
         displayName: fund?.name ?? product?.name ?? null
       }
     });
+
+    const existing = await tx.portfolioTransaction.findMany({
+      where: {
+        holdingId: holding.id,
+        transactionType: input.transactionType,
+        tradeDate: {
+          gte: new Date(`${tradeDate.toISOString().slice(0, 10)}T00:00:00.000Z`),
+          lt: new Date(`${tradeDate.toISOString().slice(0, 10)}T23:59:59.999Z`)
+        }
+      },
+      orderBy: { id: "asc" }
+    });
+    const duplicate = existing.find((transaction) =>
+      buildTransactionSignature({
+        targetType: transaction.targetType,
+        targetKey: transaction.targetKey,
+        transactionType: transaction.transactionType,
+        tradeDate: transaction.tradeDate,
+        shares: transaction.shares,
+        price: transaction.price,
+        amount: transaction.amount,
+        fee: transaction.fee
+      }) === nextSignature
+    );
+    if (duplicate) {
+      return { ...duplicate, duplicate: true };
+    }
 
     return tx.portfolioTransaction.create({
       data: {
@@ -3102,17 +3915,10 @@ export async function getFundDividends(params: {
 }
 
 export async function getComparisonData(targets: string[]) {
-  const normalized = targets
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .slice(0, 8)
-    .map((item) => {
-      if (item.startsWith("fund:") || item.startsWith("wealth:")) {
-        const [targetType, targetKey] = item.split(":");
-        return { targetType, targetKey };
-      }
-      return /^[0-9]{6}$/.test(item) ? { targetType: "fund", targetKey: item } : { targetType: "wealth", targetKey: item };
-    });
+  const normalized = parseCompareTargets(targets.join(",")).map((item) => {
+    const [targetType, targetKey] = item.split(":");
+    return { targetType, targetKey };
+  });
 
   const items = [];
   for (const target of normalized) {
@@ -3122,6 +3928,7 @@ export async function getComparisonData(targets: string[]) {
         continue;
       }
       const latest = detail.navs.at(-1);
+      const feeSummary = summarizeFeeRows(detail.fees);
       items.push({
         targetType: "fund",
         targetKey: detail.code,
@@ -3135,7 +3942,9 @@ export async function getComparisonData(targets: string[]) {
         periodReturns: detail.periodReturns,
         maxDrawdown: detail.riskMetrics.maxDrawdown,
         volatility: detail.riskMetrics.volatility,
-        fee: detail.fees[0]?.feeValue ?? null
+        fee: detail.fees[0]?.feeValue ?? null,
+        feeCost365d: estimateKnownFeeCost(feeSummary, 365, 10000),
+        dataScore: detail.dataCoverage.score
       });
     } else {
       const detail = await getWealthProductDetail(target.targetKey);
@@ -3156,7 +3965,9 @@ export async function getComparisonData(targets: string[]) {
         periodReturns: detail.periodReturns,
         maxDrawdown: null,
         volatility: null,
-        fee: detail.feeSummary
+        fee: detail.feeSummary,
+        feeCost365d: null,
+        dataScore: latest ? 60 : 30
       });
     }
   }
@@ -3164,33 +3975,109 @@ export async function getComparisonData(targets: string[]) {
   return { items };
 }
 
-export async function getAlertCenter() {
-  const watched = await prisma.watchlist.findMany({ take: 80 });
-  const holdings = await prisma.portfolioHolding.findMany({ take: 80 });
+export async function getAlertCenter(): Promise<AlertCenterResult> {
+  const now = new Date().toISOString();
+  if (alertCenterCache && isSnapshotFresh(alertCenterCache.generatedAt, now, 10)) {
+    return alertCenterCache.result;
+  }
+  const [watched, holdings, rules, portfolioSnapshot] = await Promise.all([
+    prisma.watchlist.findMany({ take: 80 }),
+    prisma.portfolioHolding.findMany({ take: 80 }),
+    prisma.alertRule.findMany({ where: { enabled: true }, orderBy: [{ createdAt: "desc" }], take: 200 }),
+    getPortfolioQuickSnapshot()
+  ]);
   const fundCodes = Array.from(
     new Set([
       ...watched.map((item) => item.fundCode).filter(Boolean),
-      ...holdings.map((item) => item.fundCode).filter(Boolean)
+      ...holdings.map((item) => item.fundCode).filter(Boolean),
+      ...rules
+        .filter((item) => item.targetType === "fund")
+        .map((item) => item.fundCode ?? item.targetKey)
+        .filter(Boolean)
     ] as string[])
   ).slice(0, 50);
   const wealthCodes = Array.from(
     new Set([
       ...watched.map((item) => item.registerCode).filter(Boolean),
-      ...holdings.map((item) => item.registerCode).filter(Boolean)
+      ...holdings.map((item) => item.registerCode).filter(Boolean),
+      ...rules
+        .filter((item) => item.targetType === "wealth")
+        .map((item) => item.registerCode ?? item.targetKey)
+        .filter(Boolean)
     ] as string[])
   ).slice(0, 50);
+  const rulesByTarget = new Map<string, typeof rules>();
+  for (const rule of rules) {
+    const key = `${rule.targetType}:${rule.targetKey ?? rule.fundCode ?? rule.registerCode ?? ""}`;
+    const bucket = rulesByTarget.get(key) ?? [];
+    bucket.push(rule);
+    rulesByTarget.set(key, bucket);
+  }
+  const portfolioByTarget = new Map(portfolioSnapshot.map((item) => [`${item.targetType}:${item.targetKey}`, item]));
 
   const alerts: AlertItem[] = [];
   for (const code of fundCodes) {
     const detail = await getFundDetail(code);
     if (detail) {
       alerts.push(...detail.warnings);
+      const latestNav = detail.navs.at(-1);
+      const oneYearReturn = detail.periodReturns.find((item) => item.rangeKey === "year_1");
+      const portfolioItem = portfolioByTarget.get(`fund:${code}`);
+      const highImpactAnnouncementCount = detail.announcements.filter((item) => item.impact?.level === "high").length;
+      for (const rule of rulesByTarget.get(`fund:${code}`) ?? []) {
+        const basicTriggered = evaluateUserAlertRule(rule, {
+          dailyRate: latestNav?.dailyGrowthRate ?? null,
+          profitRate: portfolioItem?.profitRate ?? null,
+          peerPercentile: oneYearReturn?.peerPercentile ?? null,
+          positionWeight: portfolioItem?.positionWeight ?? null,
+          highImpactAnnouncementCount
+        });
+        const advancedTriggered = evaluateAdvancedAlertRule(rule, {
+          recentDailyRates: detail.navs.slice(-5).map((item) => item.dailyGrowthRate),
+          returnValue: oneYearReturn?.rankValue ?? null,
+          peerMedianReturn: oneYearReturn?.rankValue !== null && oneYearReturn?.rankValue !== undefined ? Number(oneYearReturn.rankValue) + 10 : null,
+          maxDrawdown: detail.riskMetrics.maxDrawdown,
+          previousMaxDrawdown: null,
+          positionWeight: portfolioItem?.positionWeight ?? null
+        });
+        const triggered = basicTriggered ?? advancedTriggered;
+        if (triggered) {
+          alerts.push({
+            level: triggered.level,
+            targetType: "fund",
+            targetKey: code,
+            title: triggered.title,
+            message: `${triggered.message}${rule.note ? ` ${rule.note}` : ""}`,
+            metric: `rule:${rule.metric}`
+          });
+        }
+      }
     }
   }
   for (const code of wealthCodes) {
     const detail = await getWealthProductDetail(code);
     if (detail) {
       alerts.push(...detail.warnings);
+      const portfolioItem = portfolioByTarget.get(`wealth:${code}`);
+      const latestNav = detail.navs.at(-1);
+      for (const rule of rulesByTarget.get(`wealth:${code}`) ?? []) {
+        const triggered = evaluateUserAlertRule(rule, {
+          dailyRate: latestNav?.dailyChangeRate ?? null,
+          profitRate: portfolioItem?.profitRate ?? null,
+          positionWeight: portfolioItem?.positionWeight ?? null,
+          highImpactAnnouncementCount: 0
+        });
+        if (triggered) {
+          alerts.push({
+            level: triggered.level,
+            targetType: "wealth",
+            targetKey: code,
+            title: triggered.title,
+            message: `${triggered.message}${rule.note ? ` ${rule.note}` : ""}`,
+            metric: `rule:${rule.metric}`
+          });
+        }
+      }
     }
   }
 
@@ -3231,5 +4118,7 @@ export async function getAlertCenter() {
   }
 
   const order = { high: 0, medium: 1, low: 2 };
-  return { items: alerts.sort((a, b) => order[a.level] - order[b.level]) };
+  const result = { items: alerts.sort((a, b) => order[a.level] - order[b.level]) };
+  alertCenterCache = { generatedAt: now, result };
+  return result;
 }

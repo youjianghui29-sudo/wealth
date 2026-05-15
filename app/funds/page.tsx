@@ -3,6 +3,7 @@ import { AddCompareButton } from "@/components/CompareTray";
 import { Pagination } from "@/components/Pagination";
 import { TrendBadge } from "@/components/TrendBadge";
 import { formatDate, formatNumber } from "@/lib/format";
+import { formatSampleScope } from "@/lib/fund-ux";
 import { getFundList } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
@@ -30,13 +31,15 @@ const rangeLabels: Record<string, string> = {
 const candidateViews = [
   { key: "candidates", label: "观察候选池", href: "/funds/candidates", note: "按观察分筛出可继续跟踪的基金" },
   { key: "all", label: "全量搜索", href: "/funds", note: "保留完整列表和高级筛选" },
-  { key: "watchlist", label: "我的关注", href: "/funds?view=watchlist", note: "只看关注池" },
+  { key: "watchlist", label: "我的关注", href: "/funds/watchlist", note: "按下一步动作管理关注池" },
   { key: "strong_week", label: "近周强势", href: "/funds?view=strong_week&sort=return_desc", note: "近1周收益靠前" },
   { key: "strong_quarter", label: "近三月强势", href: "/funds?view=strong_quarter&sort=return_desc", note: "近3月收益靠前" },
   { key: "low_drawdown", label: "回撤较低", href: "/funds?view=low_drawdown&sort=drawdown_desc", note: "样本回撤不超过10%" },
   { key: "open_purchase", label: "开放申购", href: "/funds?view=open_purchase", note: "排除明显暂停申购" },
   { key: "data_ready", label: "数据较完整", href: "/funds?view=data_ready", note: "历史、资料、费率较完整" }
 ];
+
+const fundTypeChips = ["混合型", "股票型", "债券型", "指数型", "货币型", "QDII", "ETF", "FOF"];
 
 export default async function FundsPage({ searchParams }: PageProps) {
   const rawParams = await searchParams;
@@ -58,6 +61,17 @@ export default async function FundsPage({ searchParams }: PageProps) {
   const result = await getFundList(params);
   const selectedRange = params.view === "strong_week" ? "week_1" : params.view === "strong_quarter" ? "month_3" : params.returnRange ?? "year_1";
   const selectedRangeLabel = rangeLabels[selectedRange] ?? "近1年";
+  const typeHref = (type?: string) => {
+    const search = new URLSearchParams();
+    const next = { ...params, type, page: undefined };
+    for (const [key, value] of Object.entries(next)) {
+      if (value && key !== "page") {
+        search.set(key, String(value));
+      }
+    }
+    const query = search.toString();
+    return `/funds${query ? `?${query}` : ""}`;
+  };
 
   return (
     <div className="space-y-5">
@@ -107,18 +121,39 @@ export default async function FundsPage({ searchParams }: PageProps) {
         ))}
       </section>
 
-      <form className="grid gap-3 rounded-md border border-line bg-white p-4 shadow-panel lg:grid-cols-[1fr_130px_130px_120px_120px_140px_160px_100px]">
+      <section className="rounded-md border border-line bg-white p-4 shadow-panel">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <h2 className="text-sm font-semibold text-ink">按类型快速筛选</h2>
+            <p className="mt-1 text-xs text-slate-500">保留关键词搜索，类型用固定入口减少误输入。</p>
+          </div>
+          <div className="flex flex-wrap gap-2 text-sm">
+            <Link
+              href={typeHref(undefined)}
+              className={`focus-ring rounded-md border px-3 py-2 ${params.type ? "border-line bg-white text-slate-700" : "border-ink bg-ink text-white"}`}
+            >
+              全部类型
+            </Link>
+            {fundTypeChips.map((type) => (
+              <Link
+                key={type}
+                href={typeHref(type)}
+                className={`focus-ring rounded-md border px-3 py-2 ${params.type === type ? "border-ink bg-ink text-white" : "border-line bg-white text-slate-700"}`}
+              >
+                {type}
+              </Link>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <form className="grid gap-3 rounded-md border border-line bg-white p-4 shadow-panel lg:grid-cols-[1fr_130px_120px_120px_140px_160px_100px]">
         {params.view !== "all" ? <input type="hidden" name="view" value={params.view} /> : null}
+        {params.type ? <input type="hidden" name="type" value={params.type} /> : null}
         <input
           name="q"
           defaultValue={params.q}
           placeholder="搜索基金代码、名称、拼音"
-          className="focus-ring rounded-md border border-line px-3 py-2"
-        />
-        <input
-          name="type"
-          defaultValue={params.type}
-          placeholder="基金类型"
           className="focus-ring rounded-md border border-line px-3 py-2"
         />
         <select
@@ -179,7 +214,7 @@ export default async function FundsPage({ searchParams }: PageProps) {
         <div className="border-b border-line px-4 py-3 text-sm text-slate-600">
           共 {result.total} 只基金
         </div>
-        <div className="table-scroll">
+        <div className="hidden md:block table-scroll">
           <table className="w-full border-collapse text-left text-sm">
             <thead className="bg-paper text-slate-600">
               <tr>
@@ -222,7 +257,7 @@ export default async function FundsPage({ searchParams }: PageProps) {
                     {formatNumber(row.dataCompleteness, 0)}
                     {row.dataQualityLabel ? <span className="ml-1 text-xs text-slate-500">{row.dataQualityLabel}</span> : null}
                     <div className="mt-1 text-xs text-slate-500">
-                      {row.navSampleCount ?? 0} 日样本 · {row.hasProfile ? "资料" : "缺资料"} · {row.hasFee ? "费率" : "缺费率"}
+                      {formatSampleScope({ recentCount: row.navSampleCount })} · {row.hasProfile ? "资料" : "缺资料"} · {row.hasFee ? "费率" : "缺费率"}
                     </div>
                   </td>
                   <td className="px-4 py-3 text-right">
@@ -237,6 +272,42 @@ export default async function FundsPage({ searchParams }: PageProps) {
               ))}
             </tbody>
           </table>
+        </div>
+        <div className="grid gap-3 p-4 md:hidden">
+          {result.items.map((row) => (
+            <div key={`card-${row.code}`} className="rounded-md border border-line bg-paper p-3 text-sm">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <Link href={`/funds/${encodeURIComponent(row.code)}`} className="focus-ring rounded font-semibold text-ink">
+                    {row.name}
+                  </Link>
+                  <div className="mt-1 text-xs text-slate-500">{row.code} / {row.fundType ?? "--"}</div>
+                </div>
+                <TrendBadge value={row.dailyGrowthRate} />
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-600">
+                <div className="rounded-md border border-line bg-white px-3 py-2">
+                  <div>周期收益</div>
+                  <div className="mt-1"><TrendBadge value={row.selectedReturn} /></div>
+                </div>
+                <div className="rounded-md border border-line bg-white px-3 py-2">
+                  <div>样本回撤</div>
+                  <div className="mt-1 font-medium text-ink">{row.maxDrawdown === null ? "--" : `${formatNumber(row.maxDrawdown, 2)}%`}</div>
+                </div>
+                <div className="rounded-md border border-line bg-white px-3 py-2">
+                  <div>数据可信</div>
+                  <div className="mt-1 font-medium text-ink">{formatNumber(row.dataCompleteness, 0)} {row.dataQualityLabel ?? ""}</div>
+                </div>
+                <div className="rounded-md border border-line bg-white px-3 py-2">
+                  <div>申购</div>
+                  <div className="mt-1 font-medium text-ink">{row.purchaseStatus ?? "--"}</div>
+                </div>
+              </div>
+              <div className="mt-3">
+                <AddCompareButton targetType="fund" targetKey={row.code} name={row.name} />
+              </div>
+            </div>
+          ))}
         </div>
       </div>
 

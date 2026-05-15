@@ -130,6 +130,8 @@ SCHEMA_SQL = [
     "CREATE UNIQUE INDEX IF NOT EXISTS FundRankDaily_fundCode_rankDate_rangeKey_key ON FundRankDaily(fundCode, rankDate, rangeKey)",
     "CREATE INDEX IF NOT EXISTS FundRankDaily_rankDate_idx ON FundRankDaily(rankDate)",
     "CREATE INDEX IF NOT EXISTS FundRankDaily_rangeKey_idx ON FundRankDaily(rangeKey)",
+    "CREATE INDEX IF NOT EXISTS FundRankDaily_rangeKey_rankDate_idx ON FundRankDaily(rangeKey, rankDate)",
+    "CREATE INDEX IF NOT EXISTS FundRankDaily_fundCode_rangeKey_rankDate_createdAt_idx ON FundRankDaily(fundCode, rangeKey, rankDate, createdAt)",
     """
     CREATE TABLE IF NOT EXISTS FundHolding (
       id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -355,6 +357,7 @@ SCHEMA_SQL = [
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS PortfolioHolding_targetType_targetKey_key ON PortfolioHolding(targetType, targetKey)",
     "CREATE INDEX IF NOT EXISTS PortfolioHolding_targetType_idx ON PortfolioHolding(targetType)",
+    "CREATE INDEX IF NOT EXISTS PortfolioHolding_targetType_updatedAt_idx ON PortfolioHolding(targetType, updatedAt)",
     "CREATE INDEX IF NOT EXISTS PortfolioHolding_fundCode_idx ON PortfolioHolding(fundCode)",
     "CREATE INDEX IF NOT EXISTS PortfolioHolding_registerCode_idx ON PortfolioHolding(registerCode)",
     """
@@ -375,6 +378,7 @@ SCHEMA_SQL = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS PortfolioTransaction_holdingId_idx ON PortfolioTransaction(holdingId)",
+    "CREATE INDEX IF NOT EXISTS PortfolioTransaction_holdingId_tradeDate_id_idx ON PortfolioTransaction(holdingId, tradeDate, id)",
     "CREATE INDEX IF NOT EXISTS PortfolioTransaction_targetType_targetKey_idx ON PortfolioTransaction(targetType, targetKey)",
     "CREATE INDEX IF NOT EXISTS PortfolioTransaction_tradeDate_idx ON PortfolioTransaction(tradeDate)",
     "CREATE INDEX IF NOT EXISTS PortfolioTransaction_transactionType_idx ON PortfolioTransaction(transactionType)",
@@ -393,6 +397,61 @@ SCHEMA_SQL = [
     "CREATE UNIQUE INDEX IF NOT EXISTS PortfolioTarget_targetKey_key ON PortfolioTarget(targetKey)",
     "CREATE INDEX IF NOT EXISTS PortfolioTarget_targetKey_idx ON PortfolioTarget(targetKey)",
     """
+    CREATE TABLE IF NOT EXISTS CashAccount (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'CNY',
+      openingValue REAL DEFAULT 0,
+      note TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS CashAccount_name_key ON CashAccount(name)",
+    """
+    CREATE TABLE IF NOT EXISTS CashTransaction (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      accountId INTEGER NOT NULL,
+      transactionType TEXT NOT NULL,
+      transactionDate DATETIME NOT NULL,
+      amount REAL NOT NULL,
+      relatedTarget TEXT,
+      note TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT CashTransaction_accountId_fkey FOREIGN KEY (accountId) REFERENCES CashAccount(id) ON DELETE CASCADE ON UPDATE CASCADE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS CashTransaction_accountId_transactionDate_idx ON CashTransaction(accountId, transactionDate)",
+    "CREATE INDEX IF NOT EXISTS CashTransaction_transactionType_idx ON CashTransaction(transactionType)",
+    """
+    CREATE TABLE IF NOT EXISTS DashboardSnapshot (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      snapshotKey TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      generatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expiresAt DATETIME
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS DashboardSnapshot_snapshotKey_key ON DashboardSnapshot(snapshotKey)",
+    "CREATE INDEX IF NOT EXISTS DashboardSnapshot_expiresAt_idx ON DashboardSnapshot(expiresAt)",
+    """
+    CREATE TABLE IF NOT EXISTS DecisionRecord (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      targetType TEXT NOT NULL,
+      targetKey TEXT NOT NULL,
+      decisionType TEXT NOT NULL,
+      reason TEXT,
+      plannedAmount REAL,
+      reviewDate DATETIME,
+      status TEXT NOT NULL DEFAULT 'open',
+      outcomeNote TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS DecisionRecord_targetType_targetKey_reviewDate_idx ON DecisionRecord(targetType, targetKey, reviewDate)",
+    "CREATE INDEX IF NOT EXISTS DecisionRecord_status_reviewDate_idx ON DecisionRecord(status, reviewDate)",
+    """
     CREATE TABLE IF NOT EXISTS AlertRule (
       id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
       targetType TEXT NOT NULL,
@@ -410,9 +469,24 @@ SCHEMA_SQL = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS AlertRule_targetType_idx ON AlertRule(targetType)",
+    "CREATE INDEX IF NOT EXISTS AlertRule_targetType_targetKey_idx ON AlertRule(targetType, targetKey)",
     "CREATE INDEX IF NOT EXISTS AlertRule_metric_idx ON AlertRule(metric)",
+    "CREATE INDEX IF NOT EXISTS AlertRule_enabled_createdAt_idx ON AlertRule(enabled, createdAt)",
     "CREATE INDEX IF NOT EXISTS AlertRule_fundCode_idx ON AlertRule(fundCode)",
     "CREATE INDEX IF NOT EXISTS AlertRule_registerCode_idx ON AlertRule(registerCode)",
+    """
+    CREATE TABLE IF NOT EXISTS AlertAction (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      alertId TEXT NOT NULL,
+      action TEXT NOT NULL,
+      until DATETIME,
+      note TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS AlertAction_alertId_key ON AlertAction(alertId)",
+    "CREATE INDEX IF NOT EXISTS AlertAction_action_updatedAt_idx ON AlertAction(action, updatedAt)",
     """
     CREATE TABLE IF NOT EXISTS WealthNavDaily (
       id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -450,6 +524,8 @@ SCHEMA_SQL = [
     "CREATE INDEX IF NOT EXISTS Announcement_publishedAt_idx ON Announcement(publishedAt)",
     "CREATE INDEX IF NOT EXISTS Announcement_fundCode_idx ON Announcement(fundCode)",
     "CREATE INDEX IF NOT EXISTS Announcement_registerCode_idx ON Announcement(registerCode)",
+    "CREATE INDEX IF NOT EXISTS Announcement_targetType_fundCode_publishedAt_idx ON Announcement(targetType, fundCode, publishedAt)",
+    "CREATE INDEX IF NOT EXISTS Announcement_targetType_registerCode_publishedAt_idx ON Announcement(targetType, registerCode, publishedAt)",
     """
     CREATE TABLE IF NOT EXISTS Watchlist (
       id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -465,6 +541,8 @@ SCHEMA_SQL = [
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS Watchlist_targetType_targetKey_key ON Watchlist(targetType, targetKey)",
     "CREATE INDEX IF NOT EXISTS Watchlist_targetType_idx ON Watchlist(targetType)",
+    "CREATE INDEX IF NOT EXISTS Watchlist_targetType_fundCode_idx ON Watchlist(targetType, fundCode)",
+    "CREATE INDEX IF NOT EXISTS Watchlist_targetType_registerCode_idx ON Watchlist(targetType, registerCode)",
     """
     CREATE TABLE IF NOT EXISTS SyncJob (
       id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
