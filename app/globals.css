@@ -32,7 +32,8 @@ a {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -43,6 +44,35 @@ select {
 
 .table-scroll table {
   min-width: 860px;
+}
+
+.table-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.table-scroll tbody td:first-child,
+.table-scroll thead th:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  background: inherit;
+  box-shadow: 1px 0 0 rgba(203, 213, 225, 0.75);
+}
+
+.table-scroll tbody td:first-child {
+  background: white;
+}
+
+@media (max-width: 767px) {
+  .table-scroll {
+    border-top: 1px solid rgba(203, 213, 225, 0.7);
+  }
+
+  .table-scroll table {
+    min-width: 760px;
+  }
 }
 
 .focus-ring:focus-visible {

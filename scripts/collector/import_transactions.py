@@ -16,6 +16,7 @@ COLUMN_ALIASES = {
     "targetKey": ["基金代码", "产品代码", "登记编码", "代码", "标的代码", "targetKey", "target_key", "code"],
     "transactionType": ["交易类型", "业务类型", "操作", "类型", "transactionType", "transaction_type"],
     "tradeDate": ["交易日期", "确认日期", "申请日期", "日期", "tradeDate", "trade_date"],
+    "applicationDate": ["申请日期", "下单日期", "委托日期", "applicationDate", "application_date"],
     "shares": ["确认份额", "交易份额", "份额", "持有份额", "shares"],
     "price": ["确认净值", "成交净值", "单位净值", "净值", "价格", "price"],
     "amount": ["成交金额", "交易金额", "确认金额", "金额", "本金", "amount"],
@@ -268,7 +269,14 @@ def import_transactions(
           price = to_float(value_at(row, mapping, "price"))
           amount = to_float(value_at(row, mapping, "amount"))
           fee = to_float(value_at(row, mapping, "fee"))
-          note = to_text(value_at(row, mapping, "note"))
+          application_date = parse_date(value_at(row, mapping, "applicationDate"))
+          raw_note = to_text(value_at(row, mapping, "note"))
+          note_parts = []
+          if application_date:
+              note_parts.append(f"申请日期：{application_date.isoformat()}")
+          if raw_note:
+              note_parts.append(raw_note)
+          note = "\n".join(note_parts) if note_parts else None
           trade_date = parsed_date.isoformat()
           if dry_run:
               inserted += 1

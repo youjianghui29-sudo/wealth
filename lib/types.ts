@@ -87,6 +87,7 @@ export type FundCandidateItem = {
   volatility: number | null;
   dataScore: number;
   observationScore: number;
+  observationTier?: "strong" | "watchable" | "cautious";
   navSampleCount: number;
   hasProfile: boolean;
   hasFee: boolean;

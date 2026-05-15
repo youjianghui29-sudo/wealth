@@ -144,6 +144,8 @@ model FundRankDaily {
   @@unique([fundCode, rankDate, rangeKey])
   @@index([rankDate])
   @@index([rangeKey])
+  @@index([rangeKey, rankDate])
+  @@index([fundCode, rangeKey, rankDate, createdAt])
 }
 
 model FundHolding {
@@ -371,6 +373,7 @@ model PortfolioHolding {
 
   @@unique([targetType, targetKey])
   @@index([targetType])
+  @@index([targetType, updatedAt])
   @@index([fundCode])
   @@index([registerCode])
 }
@@ -391,6 +394,7 @@ model PortfolioTransaction {
   holding         PortfolioHolding? @relation(fields: [holdingId], references: [id], onDelete: Cascade)
 
   @@index([holdingId])
+  @@index([holdingId, tradeDate, id])
   @@index([targetType, targetKey])
   @@index([tradeDate])
   @@index([transactionType])
@@ -409,6 +413,60 @@ model PortfolioTarget {
   @@index([targetKey])
 }
 
+model CashAccount {
+  id           Int               @id @default(autoincrement())
+  name         String            @unique
+  currency     String            @default("CNY")
+  openingValue Float?            @default(0)
+  note         String?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+  transactions CashTransaction[]
+}
+
+model CashTransaction {
+  id              Int         @id @default(autoincrement())
+  accountId       Int
+  transactionType String
+  transactionDate DateTime
+  amount          Float
+  relatedTarget   String?
+  note            String?
+  createdAt       DateTime    @default(now())
+  account         CashAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, transactionDate])
+  @@index([transactionType])
+}
+
+model DashboardSnapshot {
+  id          Int      @id @default(autoincrement())
+  snapshotKey String
+  payload     String
+  generatedAt DateTime @default(now())
+  expiresAt   DateTime?
+
+  @@unique([snapshotKey])
+  @@index([expiresAt])
+}
+
+model DecisionRecord {
+  id             Int       @id @default(autoincrement())
+  targetType     String
+  targetKey      String
+  decisionType   String
+  reason         String?
+  plannedAmount  Float?
+  reviewDate     DateTime?
+  status         String    @default("open")
+  outcomeNote    String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([targetType, targetKey, reviewDate])
+  @@index([status, reviewDate])
+}
+
 model AlertRule {
   id           Int            @id @default(autoincrement())
   targetType   String
@@ -425,9 +483,24 @@ model AlertRule {
   product      WealthProduct? @relation(fields: [registerCode], references: [registerCode], onDelete: Cascade)
 
   @@index([targetType])
+  @@index([targetType, targetKey])
   @@index([metric])
+  @@index([enabled, createdAt])
   @@index([fundCode])
   @@index([registerCode])
+}
+
+model AlertAction {
+  id        Int      @id @default(autoincrement())
+  alertId   String
+  action    String
+  until     DateTime?
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([alertId])
+  @@index([action, updatedAt])
 }
 
 model WealthNavDaily {
@@ -465,6 +538,8 @@ model Announcement {
   @@index([publishedAt])
   @@index([fundCode])
   @@index([registerCode])
+  @@index([targetType, fundCode, publishedAt])
+  @@index([targetType, registerCode, publishedAt])
 }
 
 model Watchlist {
@@ -480,6 +555,8 @@ model Watchlist {
 
   @@unique([targetType, targetKey])
   @@index([targetType])
+  @@index([targetType, fundCode])
+  @@index([targetType, registerCode])
 }
 
 model SyncJob {
